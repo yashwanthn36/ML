@@ -13,6 +13,8 @@ from torch.utils.data import DataLoader, Subset
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from multimodal.training import set_seed, train_reference
+from multimodal.training.reference import seed_data_worker
+from multimodal.data_adapters.contract import validate_split_datasets
 from multimodal.training.splits import grouped_reference_holdout
 from multimodal.training.provenance import (make_run_provenance, configured_split_protocol,
     effective_split_protocol, ensure_protocol_output)
@@ -44,6 +46,9 @@ def main() -> None:
         dataset_kwargs["split_protocol"] = dataset_cfg["split_protocol"]
     train_set, validation_set = load_factory(dataset_cfg["factory"])(**dataset_kwargs)
     effective_split_protocol(train_set, configured_protocol)
+    require_source_disjoint = configured_protocol == "source_video_disjoint" or configured_protocol.endswith("_source_disjoint")
+    contract = validate_split_datasets(train_set, validation_set,
+                                       require_source_disjoint=require_source_disjoint)
     training_cfg = config["training"]
     estimation_fraction = float(training_cfg.get("contribution_estimation_fraction", 0.2))
     if not 0.0 <= estimation_fraction < 1.0:
@@ -73,8 +78,11 @@ def main() -> None:
     loader_options = {"batch_size": int(training_cfg["batch_size"]),
                       "num_workers": int(training_cfg["num_workers"]),
                       "pin_memory": selected_device.type == "cuda"}
-    train_loader = DataLoader(reference_train, shuffle=True, **loader_options)
-    validation_loader = DataLoader(validation_set, shuffle=False, **loader_options)
+    generator = torch.Generator().manual_seed(seed)
+    train_loader = DataLoader(reference_train, shuffle=True, worker_init_fn=seed_data_worker,
+                              generator=generator, **loader_options)
+    validation_loader = DataLoader(validation_set, shuffle=False, worker_init_fn=seed_data_worker,
+                                   generator=torch.Generator().manual_seed(seed + 1), **loader_options)
 
     model_cfg = config["model"]
     model = load_factory(model_cfg["factory"])(
@@ -88,7 +96,9 @@ def main() -> None:
         training_sample_ids=list(train_set.sample_ids), config=config,
         estimation_sample_ids=estimation_ids,
         reference_fit_sample_ids=contribution_metadata.get("fit_sample_ids", []),
+        dataset_metadata=getattr(train_set, "metadata", {}), class_to_id=train_set.class_to_id,
     )
+    run_provenance["dataset_contract"] = contract
     (output / "training_estimation_ids.json").write_text(
         json.dumps({**contribution_metadata, "indices": estimation_indices, "sample_ids": estimation_ids,
                     "split_protocol": split_protocol, "seed": seed,

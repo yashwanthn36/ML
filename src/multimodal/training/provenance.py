@@ -59,24 +59,39 @@ def checkpoint_provenance(checkpoint: dict[str, Any]) -> dict[str, Any] | None:
 def make_run_provenance(*, split_protocol: str, seed: int, run_id: str,
                         training_sample_ids: list[str], config: dict[str, Any],
                         estimation_sample_ids: list[str] | None = None,
-                        reference_fit_sample_ids: list[str] | None = None) -> dict[str, Any]:
+                        reference_fit_sample_ids: list[str] | None = None,
+                        dataset_metadata: dict[str, Any] | None = None,
+                        class_to_id: dict[str, int] | None = None) -> dict[str, Any]:
+    dataset_metadata = dataset_metadata or {}
     return {
         "split_protocol": str(split_protocol), "seed": int(seed), "run_id": str(run_id),
         "training_sample_ids_sha256": ids_hash(training_sample_ids),
         "estimation_sample_ids_sha256": ids_hash(estimation_sample_ids or []),
         "reference_fit_sample_ids_sha256": ids_hash(reference_fit_sample_ids or []),
         "experiment_config_sha256": config_hash(config),
+        "dataset_name": dataset_metadata.get("dataset_name", config.get("dataset", {}).get("name")),
+        "dataset_adapter": dataset_metadata.get("adapter", config.get("dataset", {}).get("adapter")),
+        "dataset_manifest_sha256": dataset_metadata.get("manifest_sha256"),
+        "class_to_id": class_to_id or dataset_metadata.get("class_to_id"),
     }
 
 
 def validate_checkpoint(checkpoint: dict[str, Any], *, split_protocol: str, seed: int,
                         config: dict[str, Any], training_sample_ids: list[str] | None = None,
+                        dataset_metadata: dict[str, Any] | None = None,
+                        class_to_id: dict[str, int] | None = None,
                         allow_legacy: bool = False, artifact: str = "reference checkpoint") -> dict[str, Any] | None:
     provenance = checkpoint_provenance(checkpoint)
     expected = {"split_protocol": split_protocol, "seed": int(seed),
                 "experiment_config_sha256": config_hash(config)}
     if training_sample_ids is not None:
         expected["training_sample_ids_sha256"] = ids_hash(training_sample_ids)
+    if dataset_metadata is not None:
+        expected.update({"dataset_manifest_sha256": dataset_metadata.get("manifest_sha256"),
+                         "dataset_name": dataset_metadata.get("dataset_name"),
+                         "dataset_adapter": dataset_metadata.get("adapter")})
+    if class_to_id is not None:
+        expected["class_to_id"] = class_to_id
     validate_provenance(expected, provenance, artifact=artifact, allow_legacy=allow_legacy,
                         required_keys=tuple(expected))
     return provenance
@@ -94,7 +109,8 @@ def validate_downstream_artifact(provenance: dict[str, Any] | None, *,
         return
     expected = {key: reference_provenance.get(key) for key in
                 ("split_protocol", "seed", "run_id", "training_sample_ids_sha256",
-                 "estimation_sample_ids_sha256", "experiment_config_sha256")}
+                 "estimation_sample_ids_sha256", "experiment_config_sha256",
+                 "dataset_name", "dataset_adapter", "dataset_manifest_sha256", "class_to_id")
     expected["reference_checkpoint_sha256"] = reference_sha256
     validate_provenance(expected, provenance, artifact=artifact, allow_legacy=allow_legacy,
                         required_keys=tuple(expected))

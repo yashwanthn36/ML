@@ -24,6 +24,13 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def seed_data_worker(worker_id: int) -> None:
+    """Seed Python and NumPy in each DataLoader worker from PyTorch's worker seed."""
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
 def sample_modality_mask(batch_size: int, probability: float, device: torch.device) -> torch.Tensor:
     """Randomly remove at most one modality per example for missing-path training."""
     mask = torch.ones(batch_size, 2, device=device)
@@ -88,6 +95,7 @@ def train_reference(model: nn.Module, train_loader: DataLoader, validation_loade
     )
     run_metadata = experiment_metadata(config)
     run_metadata["device"] = str(device)
+    run_metadata["model_condition"] = "reference"
     (run_dir / "experiment_metadata.json").write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
     try:
         for epoch in range(1, int(training["epochs"]) + 1):
@@ -108,29 +116,36 @@ def train_reference(model: nn.Module, train_loader: DataLoader, validation_loade
                 loss_sum += float(loss.detach()) * labels.numel()
                 count += labels.numel()
             metrics = evaluate(model, validation_loader, device)
-            record = {"epoch": epoch, "split_protocol": protocol, "device": str(device),
+            record = {"epoch": epoch, "seed": seed, "split_protocol": protocol, "device": str(device),
+                      "model_condition": "reference", "training_objective": "natural_cross_entropy",
+                      "lambda_mi": None, "checkpoint_selection_metric": "val_macro_f1",
                       "run_provenance": (data_metadata or {}).get("provenance"),
                       "train_loss": loss_sum / max(count, 1),
                       **{f"val_{key}": value for key, value in metrics.items()}}
-            history.write(json.dumps(record) + "\n")
-            history.flush()
             print(f"epoch={epoch:03d} train_loss={loss_sum / max(count, 1):.4f} "
                   f"val_loss={metrics['loss']:.4f} val_macro_f1={metrics['macro_f1']:.4f} "
                   f"val_balanced_acc={metrics['balanced_accuracy']:.4f}")
             if metrics["macro_f1"] > best_f1:
                 best_f1, stale = metrics["macro_f1"], 0
+                record["checkpoint_selected"] = True
                 torch.save({"model_state_dict": model.state_dict(), "config": config,
                             "seed": seed, "epoch": epoch, "validation_metrics": metrics,
                             "split_protocol": protocol, "data_metadata": data_metadata or {},
                             "run_provenance": (data_metadata or {}).get("provenance"),
                             "device": str(device),
+                            "model_condition": "reference", "training_objective": "natural_cross_entropy",
+                            "checkpoint_selection_metric": "val_macro_f1",
                             "experiment_metadata": run_metadata},
                            checkpoint_path)
             else:
+                record["checkpoint_selected"] = False
                 stale += 1
-                if stale >= int(training["early_stopping_patience"]):
-                    print(f"early stopping after {epoch} epochs")
-                    break
+            history.seek(0, 2)
+            history.write(json.dumps(record) + "\n")
+            history.flush()
+            if not record["checkpoint_selected"] and stale >= int(training["early_stopping_patience"]):
+                print(f"early stopping after {epoch} epochs")
+                break
     finally:
         history.close()
     return checkpoint_path

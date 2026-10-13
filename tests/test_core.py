@@ -1,4 +1,5 @@
 import csv
+import json
 import math
 import sys
 import wave
@@ -12,6 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from ave_mm.splits import source_video_disjoint_split
 from ave_mm.dataset import AVEDataset
+from ave_mm.integrity import audit_manifest
 from multimodal.contribution.fcd import InfoNCEFCD
 from multimodal.contribution.signatures import estimate_reference_fcd, estimate_signatures
 from multimodal.grouping.profiles import cluster_profiles
@@ -154,7 +156,7 @@ def test_moo_conflicting_degenerate_and_optimizer_update():
     assert math.isfinite(diagnostics["cosine"])
 
 
-def test_dataset_short_audio_policy_and_invalid_interval(tmp_path, monkeypatch):
+def test_dataset_full_clip_ignores_invalid_annotation_but_event_policy_rejects_it(tmp_path, monkeypatch):
     audio = tmp_path / "a.wav"
     with wave.open(str(audio), "wb") as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
@@ -164,12 +166,13 @@ def test_dataset_short_audio_policy_and_invalid_interval(tmp_path, monkeypatch):
         writer = csv.DictWriter(f, fieldnames=["sample_id", "video_id", "label", "label_id", "split",
             "time_start", "time_end", "video_path", "audio_path"])
         writer.writeheader(); writer.writerow({"sample_id":"s", "video_id":"v", "label":"c", "label_id":0,
-            "split":"train", "time_start":.2, "time_end":.3, "video_path":"v.mp4", "audio_path":"a.wav"})
+            "split":"train", "time_start":0, "time_end":0, "video_path":"v.mp4", "audio_path":"a.wav"})
     class Capture:
+        seeks = []
         def __init__(self, path): pass
         def isOpened(self): return True
-        def get(self, prop): return 10 if prop == 5 else 10
-        def set(self, *args): pass
+        def get(self, prop): return 10 if prop == 5 else 20
+        def set(self, prop, value): self.seeks.append(value)
         def read(self):
             frame = np.zeros((8, 8, 3), dtype=np.uint8)
             frame[:, :, 0] = 255
@@ -178,18 +181,52 @@ def test_dataset_short_audio_policy_and_invalid_interval(tmp_path, monkeypatch):
     monkeypatch.setattr("ave_mm.dataset.cv2.VideoCapture", Capture)
     ds = AVEDataset(manifest, "train", root=tmp_path, num_frames=2, image_size=8, audio_samples=16000,
                     temporal_window_policy="full_clip")
+    original_row = dict(ds.rows[0])
     item = ds[0]
     assert item["modality_1"].shape == (16000,)
     assert item["modality_2"].shape == (2, 3, 8, 8)
     assert item["modality_2"][0, 0].max() == 0
     assert item["modality_2"][0, 2].max() == 1
-    ds.rows[0]["time_end"] = ds.rows[0]["time_start"]
-    with pytest.raises(ValueError, match="Invalid annotated event interval"):
-        ds[0]
-    short = AVEDataset(manifest, "train", root=tmp_path, num_frames=2, image_size=8, audio_samples=16000,
-                       temporal_window_policy="annotated_event", min_audio_coverage=.5)
+    assert max(Capture.seeks) > 1000  # Full-clip video sampling uses its 2 s duration, not the 1 s WAV duration.
+    assert ds.rows[0] == original_row
+    assert (item["sample_id"], item["label"].item(), ds.rows[0]["time_start"], ds.rows[0]["time_end"]) == (
+        "s", 0, "0", "0")
+    assert item["annotation_time_start"] == "0" and item["annotation_time_end"] == "0"
+    assert audit_manifest(ds.rows)["invalid_intervals"][0]["sample_id"] == "s"
+    event = AVEDataset(manifest, "train", root=tmp_path, num_frames=2, image_size=8, audio_samples=16000,
+                       temporal_window_policy="annotated_event")
+    with pytest.raises(ValueError, match="Invalid annotated event interval.*s.*time_end > time_start"):
+        event[0]
+
+
+@pytest.mark.parametrize(("start", "end"), [("nan", "1"), ("", "1"), ("2", "1")])
+def test_annotated_event_rejects_nonfinite_missing_and_reversed_intervals(tmp_path, monkeypatch, start, end):
+    audio = tmp_path / "a.wav"
+    with wave.open(str(audio), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+        w.writeframes(np.ones(32000, dtype="<i2").tobytes())
+    manifest = tmp_path / "m.csv"
+    with manifest.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["sample_id", "video_id", "label", "label_id", "split",
+            "time_start", "time_end", "video_path", "audio_path"])
+        writer.writeheader(); writer.writerow({"sample_id": "bad", "video_id": "v", "label": "c",
+            "label_id": 0, "split": "train", "time_start": start, "time_end": end,
+            "video_path": "v.mp4", "audio_path": "a.wav"})
+    class Capture:
+        def __init__(self, path): pass
+        def isOpened(self): return True
+        def get(self, prop): return 10 if prop == 5 else 20
+        def set(self, *args): pass
+        def read(self): return True, np.zeros((8, 8, 3), dtype=np.uint8)
+        def release(self): pass
+    monkeypatch.setattr("ave_mm.dataset.cv2.VideoCapture", Capture)
+    event = AVEDataset(manifest, "train", root=tmp_path, num_frames=2, image_size=8, audio_samples=16000,
+                       temporal_window_policy="annotated_event")
+    with pytest.raises(ValueError, match="Invalid annotated event interval.*bad"):
+        event[0]
+    event.rows[0]["time_start"], event.rows[0]["time_end"] = "0", "0.1"
     with pytest.raises(ValueError, match="fills only"):
-        short[0]
+        event[0]
 
 
 class TokenEncoder(nn.Module):
@@ -275,6 +312,10 @@ def make_tiny_test_dataset(**kwargs):
     return TinyDataset(20)
 
 
+def make_tiny_training_datasets(**kwargs):
+    return TinyDataset(), TinyDataset(10)
+
+
 def test_reference_to_joint_checkpoint_smoke(tmp_path):
     train = TinyDataset()
     validation = TinyDataset(10)
@@ -316,7 +357,7 @@ def test_reference_to_joint_checkpoint_smoke(tmp_path):
     assert joint["epoch"] == 1
     config_path = tmp_path / "smoke.yaml"
     config = {"seed": 2, "device": "cpu", "output_dir": str(tmp_path / "eval"),
-              "dataset": {"split_protocol": "synthetic", "kwargs": {}},
+              "dataset": {"split_protocol": "synthetic", "factory": "tests.test_core:make_tiny_training_datasets", "kwargs": {}},
               "test_dataset": {"split_protocol": "synthetic", "factory": "tests.test_core:make_tiny_test_dataset", "kwargs": {}},
               "model": {"factory": "tests.test_core:make_tiny_model", "kwargs": {}},
               "training": {"batch_size": 2, "num_workers": 0}, "contribution": {}}
@@ -330,3 +371,18 @@ def test_reference_to_joint_checkpoint_smoke(tmp_path):
         sys.argv = previous_argv
     metrics_path = tmp_path / "eval" / "seed_2" / "test" / "test_metrics.json"
     assert metrics_path.exists()
+    metrics = json.loads(metrics_path.read_text())
+    assert metrics["split_protocol"] == "synthetic"
+    assert metrics["seed"] == 2 and metrics["test_sample_count"] == 4
+    assert metrics["audio_video"]["macro_precision"] >= 0
+    assert metrics["audio_video"]["per_class_average_precision"]
+    prediction_path = metrics_path.with_name("test_predictions.csv")
+    with prediction_path.open(newline="") as handle:
+        prediction_rows = list(csv.DictReader(handle))
+    assert len(prediction_rows) == 4
+    for row in prediction_rows:
+        for condition in ("audio_video", "audio_only", "video_only"):
+            probs = [float(row[f"prob_{condition}_class_{i}"]) for i in range(2)]
+            assert sum(probs) == pytest.approx(1.)
+            assert int(row[f"prediction_{condition}"]) == int(np.argmax(probs))
+        assert int(row["true_class_id"]) == int(row["label"])

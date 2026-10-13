@@ -1,5 +1,7 @@
 seed: 17
 device: auto
+evaluation:
+  minority_bottom_quantile: 0.25
 output_dir: outputs/ave/source_video_disjoint
 dataset:
   factory: ave_mm.dataset:build_datasets

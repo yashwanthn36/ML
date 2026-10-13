@@ -48,9 +48,9 @@ def _scope_alignment(information: torch.Tensor, labels: torch.Tensor,
 
 
 def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: DataLoader,
-                *, training: dict[str, Any], targets: dict[str, Any],
+                *, training: dict[str, Any], targets: dict[str, Any] | None,
                 group_assignments: dict[str, int] | None,
-                fcd_estimator: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+                fcd_estimator: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None,
                 run_dir: Path, seed: int, config: dict[str, Any],
                 reference_checkpoint: dict[str, Any] | None = None,
                 reference_checkpoint_sha256: str | None = None,
@@ -76,8 +76,6 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
     model.freeze_encoders = True
     model.encoder_1.eval()
     model.encoder_2.eval()
-    if hasattr(fcd_estimator, "reset_queue"):
-        fcd_estimator.reset_queue()
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not parameters:
         raise ValueError("No trainable fusion/projection parameters remain for stage-two optimization")
@@ -85,14 +83,27 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
                                   weight_decay=float(training["weight_decay"]))
     mode = str(training.get("optimization_mode", "fixed_weight"))
     ci_mode = str(training.get("ci_objective", "class_balanced"))
+    objective = str(training.get("training_objective", "ci_mi"))
+    if objective not in {"ci_only", "ci_mi"}:
+        raise ValueError("training_objective must be 'ci_only' or 'ci_mi'")
+    if objective == "ci_mi" and targets is None:
+        raise ValueError("The proposed CI + MI objective requires contribution targets")
+    if objective == "ci_mi" and fcd_estimator is None:
+        raise ValueError("The proposed CI + MI objective requires an FCD estimator")
+    if objective == "ci_only" and ci_mode != "class_balanced":
+        raise ValueError("The controlled CI-only baseline requires ci_objective='class_balanced'")
+    model_condition = "ci_only" if objective == "ci_only" else "proposed_ci_mi"
+    if objective == "ci_mi" and hasattr(fcd_estimator, "reset_queue"):
+        fcd_estimator.reset_queue()
     granularity = str(config.get("contribution", {}).get("target_granularity", "global"))
     split_protocol = effective_split_protocol(train_loader.dataset,
         config.get("dataset", {}).get("split_protocol"))
     epsilon = float(config.get("contribution", {}).get("epsilon", 1e-8))
-    lambda_mi = float(training.get("lambda_mi", 0.1))
+    lambda_mi = float(training.get("lambda_mi", 0.1)) if objective == "ci_mi" else None
     run_dir.mkdir(parents=True, exist_ok=True)
     run_metadata = experiment_metadata(config)
     run_metadata["device"] = str(device)
+    run_metadata["model_condition"] = model_condition
     (run_dir / "experiment_metadata.json").write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
     run_provenance = {**(reference_checkpoint.get("run_provenance") or {}),
                       "reference_checkpoint_sha256": reference_checkpoint_sha256}
@@ -147,21 +158,25 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
                     loss_ci = class_balanced_ce(logits, labels, class_counts or None)
                 else:
                     loss_ci = nn.functional.cross_entropy(logits, labels)
-                if not hasattr(fcd_estimator, "per_sample_information") or not hasattr(fcd_estimator, "distribution"):
-                    raise TypeError("FCD estimator must provide per_sample_information and distribution methods")
-                information = fcd_estimator.per_sample_information(
-                    fused, modality_1, modality_2, update_queue=True,
-                    sample_ids=[str(sample_id) for sample_id in ids] if ids else None,
-                    source_ids=[str(source_id) for source_id in batch.get("source_id", [])]
-                    if batch.get("source_id") else None,
-                )
-                if information.shape != (labels.shape[0], 2):
-                    raise ValueError("FCD information estimator must return signed [batch, 2] MI bounds")
-                loss_mi = _scope_alignment(information, labels, group_ids, targets,
-                                           granularity, epsilon, fcd_estimator)
+                loss_mi = None
+                if objective == "ci_mi":
+                    if not hasattr(fcd_estimator, "per_sample_information") or not hasattr(fcd_estimator, "distribution"):
+                        raise TypeError("FCD estimator must provide per_sample_information and distribution methods")
+                    information = fcd_estimator.per_sample_information(
+                        fused, modality_1, modality_2, update_queue=True,
+                        sample_ids=[str(sample_id) for sample_id in ids] if ids else None,
+                        source_ids=[str(source_id) for source_id in batch.get("source_id", [])]
+                        if batch.get("source_id") else None,
+                    )
+                    if information.shape != (labels.shape[0], 2):
+                        raise ValueError("FCD information estimator must return signed [batch, 2] MI bounds")
+                    loss_mi = _scope_alignment(information, labels, group_ids, targets,
+                                               granularity, epsilon, fcd_estimator)
                 optimizer.zero_grad(set_to_none=True)
                 diagnostics = {}
-                if mode == "fixed_weight":
+                if objective == "ci_only":
+                    loss_ci.backward()
+                elif mode == "fixed_weight":
                     (loss_ci + lambda_mi * loss_mi).backward()
                 elif mode == "moo":
                     gradients_ci = torch.autograd.grad(loss_ci, parameters, retain_graph=True, allow_unused=True)
@@ -179,32 +194,41 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
                 torch.nn.utils.clip_grad_norm_(parameters, float(training["grad_clip"]))
                 optimizer.step()
                 sums["loss_ci"] += float(loss_ci.detach())
-                sums["loss_mi"] += float(loss_mi.detach())
+                if loss_mi is not None:
+                    sums["loss_mi"] += float(loss_mi.detach())
                 sums["steps"] += 1
             metrics = evaluate(model, validation_loader, device)
-            record = {"epoch": epoch, "mode": mode, "ci_objective": ci_mode,
+            record = {"epoch": epoch, "seed": seed, "mode": mode, "ci_objective": ci_mode,
+                      "training_objective": objective, "model_condition": model_condition,
                       "split_protocol": split_protocol,
                       "device": str(device), "run_provenance": run_provenance,
                       "granularity": granularity, "lambda_mi": lambda_mi,
+                      "mi_objective_applied": objective == "ci_mi",
                       "train_loss_ci": sums["loss_ci"] / max(sums["steps"], 1),
-                      "train_loss_mi": sums["loss_mi"] / max(sums["steps"], 1),
+                      "train_loss_mi": (sums["loss_mi"] / max(sums["steps"], 1)
+                                        if objective == "ci_mi" else None),
                       "moo_gradient_cosine_mean": sums["gradient_cosine"] / max(sums["steps"], 1),
                       "moo_gradient_norm_ci_mean": sums["gradient_norm_ci"] / max(sums["steps"], 1),
                       "moo_gradient_norm_mi_mean": sums["gradient_norm_mi"] / max(sums["steps"], 1),
                       "moo_negative_cosine_fraction": sums["negative_cosine"] / max(sums["steps"], 1),
+                      "checkpoint_selection_metric": "val_macro_f1",
                       **{f"val_{key}": value for key, value in metrics.items()}}
-            history.write(json.dumps(record) + "\n")
-            history.flush()
-            print(json.dumps(record))
             if metrics["macro_f1"] > best_f1:
                 best_f1, stale = metrics["macro_f1"], 0
+                record["checkpoint_selected"] = True
                 torch.save({"model_state_dict": model.state_dict(), "config": config,
                             "seed": seed, "epoch": epoch, "validation_metrics": metrics,
                             "optimization_mode": mode, "split_protocol": split_protocol,
                             "experiment_metadata": run_metadata, "device": str(device),
-                            "run_provenance": run_provenance}, checkpoint_path)
+                            "run_provenance": run_provenance, "model_condition": model_condition,
+                            "training_objective": objective, "lambda_mi": lambda_mi,
+                            "checkpoint_selection_metric": "val_macro_f1"}, checkpoint_path)
             else:
+                record["checkpoint_selected"] = False
                 stale += 1
-                if stale >= int(training["early_stopping_patience"]):
-                    break
+            history.write(json.dumps(record) + "\n")
+            history.flush()
+            print(json.dumps(record))
+            if not record["checkpoint_selected"] and stale >= int(training["early_stopping_patience"]):
+                break
     return checkpoint_path

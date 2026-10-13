@@ -19,6 +19,8 @@ from multimodal.training.device import select_device
 from multimodal.training.provenance import (checkpoint_provenance, effective_split_protocol,
     file_sha256, validate_checkpoint, validate_provenance, configured_split_protocol,
     ensure_protocol_output)
+from multimodal.data_adapters.contract import validate_dataset
+from multimodal.training.reference import seed_data_worker
 
 
 def load_factory(spec: str):
@@ -48,10 +50,12 @@ def main() -> None:
         dataset_kwargs["split_protocol"] = dataset_cfg["split_protocol"]
     train_set, _ = load_factory(dataset_cfg["factory"])(**dataset_kwargs)
     split_protocol = effective_split_protocol(train_set, configured_protocol)
+    validate_dataset(train_set, name="training")
     checkpoint_path = args.checkpoint if args.checkpoint.is_absolute() else PROJECT_ROOT / args.checkpoint
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     ref_provenance = validate_checkpoint(checkpoint, split_protocol=split_protocol,
         seed=int(config["seed"]), config=config, training_sample_ids=list(train_set.sample_ids),
+        dataset_metadata=getattr(train_set, "metadata", {}), class_to_id=train_set.class_to_id,
         allow_legacy=args.allow_legacy_artifacts)
     model = load_factory(model_cfg["factory"])(num_classes=train_set.num_classes,
                                                 **model_cfg.get("kwargs", {}))
@@ -88,7 +92,8 @@ def main() -> None:
         raise ValueError("Estimation ID metadata does not exactly match the current training dataset")
     loader_args = {"batch_size": int(training_cfg["batch_size"]), "shuffle": False,
                    "num_workers": int(training_cfg["num_workers"]), "pin_memory": device.type == "cuda"}
-    estimation_loader = DataLoader(estimation_set, **loader_args)
+    estimation_loader = DataLoader(estimation_set, worker_init_fn=seed_data_worker,
+                                   generator=torch.Generator().manual_seed(int(config["seed"])), **loader_args)
     signatures_path = estimate_signatures(model, estimation_loader, out / "estimation_signatures.csv", device=device)
     fcd_spec = config.get("contribution", {}).get("fcd_factory")
     if not fcd_spec:
@@ -101,7 +106,8 @@ def main() -> None:
     (out / "reference_fcd.json").write_text(json.dumps(reference_fcd, indent=2), encoding="utf-8")
     all_signatures_path = None
     if len(estimation_set) != len(train_set):
-        all_loader = DataLoader(train_set, **loader_args)
+        all_loader = DataLoader(train_set, worker_init_fn=seed_data_worker,
+                                generator=torch.Generator().manual_seed(int(config["seed"]) + 1), **loader_args)
         all_signatures_path = estimate_signatures(model, all_loader, out / "all_training_signatures.csv", device=device)
     contribution_cfg = config.get("contribution", {})
     grouping = cluster_profiles(

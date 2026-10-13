@@ -1,4 +1,5 @@
 import json
+import csv
 
 import pytest
 import torch
@@ -7,6 +8,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from ave_mm.integrity import audit_manifest
+from ave_mm.dataset import AVEDataset
 from multimodal.contribution.fcd import InfoNCEFCD
 from multimodal.training.device import select_device
 from multimodal.models.fusion import TwoModalityFusion
@@ -17,8 +19,12 @@ from multimodal.training.provenance import (
     validate_checkpoint,
     validate_downstream_artifact,
 )
+from multimodal.training.classification_metrics import (
+    classification_metrics, identify_minority_classes, validate_probabilities,
+)
 from multimodal.training.reference import train_reference
 from multimodal.training.joint import train_joint
+from multimodal.training.selection import select_validation_macro_f1
 
 
 class _ProtocolTinyDataset(Dataset):
@@ -211,6 +217,26 @@ def test_manifest_audit_preserves_legitimate_nonoverlapping_segments_and_checks_
     assert not audit_manifest(rows, summary=summary)["summary_consistent"]
 
 
+def test_ave_label_id_mapping_is_identical_across_splits(tmp_path):
+    manifest = tmp_path / "mapping.csv"
+    fields = ["sample_id", "video_id", "label", "label_id", "split", "time_start", "time_end",
+              "video_path", "audio_path"]
+    with manifest.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows([
+            {"sample_id": "a", "video_id": "v1", "label": "alpha", "label_id": 0,
+             "split": "train", "time_start": 0, "time_end": 1, "video_path": "v1.mp4", "audio_path": "v1.wav"},
+            {"sample_id": "b", "video_id": "v2", "label": "beta", "label_id": 1,
+             "split": "val", "time_start": 0, "time_end": 1, "video_path": "v2.mp4", "audio_path": "v2.wav"},
+            {"sample_id": "c", "video_id": "v3", "label": "alpha", "label_id": 0,
+             "split": "test", "time_start": 0, "time_end": 1, "video_path": "v3.mp4", "audio_path": "v3.wav"},
+        ])
+    datasets = [AVEDataset(manifest, split, root=tmp_path) for split in ("train", "val", "test")]
+    assert [dataset.class_names for dataset in datasets] == [["alpha", "beta"]] * 3
+    assert [dataset.class_to_id for dataset in datasets] == [{"alpha": 0, "beta": 1}] * 3
+
+
 def test_fcd_same_source_and_sample_id_exclusions_cover_current_batch_and_queue():
     estimator = InfoNCEFCD(queue_size=4, exclude_same_source_negatives=True)
     fused = torch.eye(2)
@@ -242,4 +268,85 @@ def test_fcd_fallback_without_source_ids_and_device_selection(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="CUDA was explicitly requested.*false"):
         select_device("cuda", log=False)
+
+
+def test_minority_classes_use_training_counts_only_and_include_quantile_ties():
+    result = identify_minority_classes([0] * 10 + [1] * 5 + [2] + [3],
+                                       class_names=["major", "mid", "minor-a", "minor-b"])
+    assert result["minority_class_ids"] == [2, 3]
+    assert result["training_class_counts"] == {"0": 10, "1": 5, "2": 1, "3": 1}
+    assert result["minority_class_names"] == ["minor-a", "minor-b"]
+    assert "training count" in result["rule"]
+
+
+def test_metrics_per_class_ap_confusion_and_undefined_missing_positive():
+    names = ["cat", "dog", "bird"]
+    y_true = [0, 0, 1, 1]
+    probs = torch.tensor([[.8, .1, .1], [.4, .5, .1], [.2, .7, .1], [.6, .3, .1]]).numpy()
+    metrics = classification_metrics(y_true, probs, class_names=names, minority_class_ids=[1, 2])
+    assert metrics["accuracy"] == pytest.approx(.5)
+    assert metrics["macro_f1"] == pytest.approx(1 / 3)
+    assert metrics["balanced_accuracy"] == pytest.approx(.5)
+    assert metrics["macro_precision"] == pytest.approx(1 / 3)
+    assert metrics["macro_recall"] == pytest.approx(1 / 3)
+    assert metrics["weighted_f1"] == pytest.approx(.5)
+    assert metrics["per_class"][0]["class_name"] == "cat"
+    assert metrics["per_class"][0]["precision"] == pytest.approx(.5)
+    assert metrics["per_class"][0]["recall"] == pytest.approx(.5)
+    assert metrics["per_class"][0]["f1"] == pytest.approx(.5)
+    assert metrics["per_class"][0]["support"] == 2
+    assert metrics["per_class"][0]["average_precision"] == pytest.approx(5 / 6)
+    assert metrics["per_class"][2]["average_precision"] is None
+    assert metrics["macro_average_precision"] is not None
+    assert metrics["confusion_matrix"] == [[1, 1, 0], [1, 1, 0], [0, 0, 0]]
+    assert metrics["confusion_matrix_row_normalized"] == [[.5, .5, 0.], [.5, .5, 0.], [0., 0., 0.]]
+    assert metrics["minority_macro_f1"] == pytest.approx(.25)
+    assert metrics["minority_macro_recall"] == pytest.approx(.25)
+    with pytest.raises(ValueError, match="sum to one"):
+        validate_probabilities(torch.tensor([[.2, .2]]).numpy(), num_classes=2)
+    with pytest.raises(ValueError, match="non-finite"):
+        validate_probabilities(torch.tensor([[float("nan"), 0.]]).numpy(), num_classes=2)
+
+
+def test_ci_only_training_never_calls_mi_estimator_and_updates_ci_parameters(tmp_path):
+    train, validation = _ProtocolTinyDataset("official", "train"), _ProtocolTinyDataset("official", "val")
+    reference_model = _tiny_model()
+    reference_model(torch.randn(2, 3), torch.randn(2, 3))
+    reference = {"model_state_dict": reference_model.state_dict(), "split_protocol": "official"}
+    before = {key: value.clone() for key, value in reference["model_state_dict"].items()}
+
+    class ForbiddenMI:
+        def reset_queue(self):
+            raise AssertionError("CI-only training must not reset or use an MI estimator")
+        def per_sample_information(self, *args, **kwargs):
+            raise AssertionError("CI-only training must not estimate MI")
+        def distribution(self, *args, **kwargs):
+            raise AssertionError("CI-only training must not build contribution distributions")
+
+    run_config = {"seed": 17, "device": "cpu", "dataset": {"split_protocol": "official"},
+                  "contribution": {"target_granularity": "global"}}
+    run_dir = tmp_path / "ci_only"
+    checkpoint_path = train_joint(_tiny_model(), DataLoader(train, batch_size=2),
+        DataLoader(validation, batch_size=2), training={"learning_rate": .02, "weight_decay": 0.,
+            "epochs": 1, "modality_dropout": 0., "grad_clip": 1., "early_stopping_patience": 1,
+            "optimization_mode": "fixed_weight", "ci_objective": "class_balanced",
+            "training_objective": "ci_only"}, targets=None, group_assignments=None,
+        fcd_estimator=ForbiddenMI(), run_dir=run_dir, seed=17, config=run_config,
+        reference_checkpoint=reference, device=torch.device("cpu"))
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    assert payload["model_condition"] == "ci_only"
+    assert payload["training_objective"] == "ci_only"
+    assert payload["lambda_mi"] is None
+    assert any(not torch.equal(before[key], value) for key, value in payload["model_state_dict"].items())
+    record = json.loads((run_dir / "training_log.jsonl").read_text().splitlines()[0])
+    assert record["mi_objective_applied"] is False
+    assert record["train_loss_mi"] is None
+
+
+def test_lambda_selection_uses_validation_macro_f1_only():
+    selected = select_validation_macro_f1([
+        {"lambda_mi": .01, "validation_macro_f1": .72, "test_macro_f1": .1},
+        {"lambda_mi": 10., "validation_macro_f1": .61, "test_macro_f1": 1.},
+    ])
+    assert selected["lambda_mi"] == .01
 

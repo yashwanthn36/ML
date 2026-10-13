@@ -10,6 +10,8 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from multimodal.data_adapters.media import read_video_frames
+from multimodal.training.provenance import file_sha256
 
 
 class AVEDataset(Dataset):
@@ -52,11 +54,31 @@ class AVEDataset(Dataset):
         if not self.rows:
             raise ValueError(f"No rows for split={split!r} in {self.manifest_path}")
         self.split = split
-        self.classes = sorted({row["label"] for row in rows})
-        self.num_classes = max(int(row["label_id"]) for row in rows) + 1
+        label_to_id: dict[str, int] = {}
+        id_to_label: dict[int, str] = {}
+        for row in rows:
+            name, class_id = row["label"], int(row["label_id"])
+            if name in label_to_id and label_to_id[name] != class_id:
+                raise ValueError(f"Class label {name!r} maps to multiple IDs in {self.manifest_path}")
+            if class_id in id_to_label and id_to_label[class_id] != name:
+                raise ValueError(f"Class ID {class_id} maps to multiple labels in {self.manifest_path}")
+            label_to_id[name], id_to_label[class_id] = class_id, name
+        self.num_classes = max(id_to_label) + 1
+        if set(id_to_label) != set(range(self.num_classes)):
+            raise ValueError(f"Class IDs in {self.manifest_path} must be contiguous from zero")
+        self.class_names = [id_to_label[i] for i in range(self.num_classes)]
+        self.class_to_id = dict(label_to_id)
+        self.classes = list(self.class_names)
         self.labels = [int(row["label_id"]) for row in self.rows]
         self.sample_ids = [row["sample_id"] for row in self.rows]
         self.source_ids = [row["video_id"] for row in self.rows]
+        self.metadata = {"dataset_name": "ave", "adapter": "ave_mm.dataset:AVEDataset",
+                         "manifest_path": str(self.manifest_path), "manifest_sha256": file_sha256(self.manifest_path),
+                         "split": split, "split_protocol": self.split_protocol,
+                         "class_to_id": self.class_to_id,
+                         "preprocessing": {"sample_rate": self.sample_rate, "audio_samples": self.audio_samples,
+                                           "num_frames": self.num_frames, "image_size": self.image_size,
+                                           "temporal_window_policy": self.temporal_window_policy}}
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -94,65 +116,45 @@ class AVEDataset(Dataset):
                              "use full_clip or adjust the window policy/length")
         return torch.from_numpy(output), coverage
 
-    def _read_video(self, path: Path, start: float, end: float) -> torch.Tensor:
-        if not np.isfinite(start) or not np.isfinite(end) or end <= start:
-            raise ValueError(f"Invalid video interval [{start}, {end}) for {path}")
-        capture = cv2.VideoCapture(str(path))
-        if not capture.isOpened():
-            raise OSError(f"Could not open video: {path}")
-        fps, frame_count = capture.get(cv2.CAP_PROP_FPS), capture.get(cv2.CAP_PROP_FRAME_COUNT)
-        duration = frame_count / fps if fps > 0 else max(end, 0.1)
-        start = max(0.0, min(start, max(duration - 0.01, 0.0)))
-        end = max(start + 0.01, min(end, duration))
-        times = np.linspace(start, end, self.num_frames, endpoint=False, dtype=np.float64)
-        times += max((end - start) / (2 * self.num_frames), 0.005)
-        times = np.minimum(times, max(duration - 0.01, 0.0))
-        frames, last_good = [], None
-        try:
-            for second in times:
-                capture.set(cv2.CAP_PROP_POS_MSEC, float(second * 1000.0))
-                ok, frame = capture.read()
-                if ok:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    last_good = cv2.resize(frame, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
-                elif last_good is not None:
-                    frame = last_good
-                else:
-                    continue
-                frames.append(frame)
-        finally:
-            capture.release()
-        if not frames:
-            raise OSError(f"Could not decode any frames from {path}")
-        while len(frames) < self.num_frames:
-            frames.append(frames[-1])
-        array = np.stack(frames[:self.num_frames]).astype(np.float32) / 255.0
-        return torch.from_numpy(array).permute(0, 3, 1, 2).contiguous()
+    def _read_video(self, path: Path, start: float | None, end: float | None) -> torch.Tensor:
+        return read_video_frames(path, start=start, end=end,
+                                 num_frames=self.num_frames, image_size=self.image_size)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.rows[index]
-        event_start, event_end = float(row["time_start"]), float(row["time_end"])
-        if not np.isfinite(event_start) or not np.isfinite(event_end) or event_end <= event_start:
-            raise ValueError(f"Invalid annotated event interval for sample {row['sample_id']}: "
-                             f"[{event_start}, {event_end})")
         audio_path = self._path(row["audio_path"])
         if self.temporal_window_policy == "full_clip":
+            # This policy samples the available clip; AVE annotations are metadata
+            # and can be invalid (the published manifest includes a zero-length row).
             with wave.open(str(audio_path), "rb") as wav:
                 clip_end = wav.getnframes() / wav.getframerate()
             start, end = 0.0, clip_end
+            video_start, video_end = None, None
         else:
-            start, end = event_start, event_end
+            try:
+                start, end = float(row["time_start"]), float(row["time_end"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid annotated event interval for sample {row.get('sample_id', '<unknown>')}: "
+                                 f"time_start={row.get('time_start')!r}, time_end={row.get('time_end')!r}; "
+                                 "expected finite numeric values with time_end > time_start") from exc
+            if not np.isfinite(start) or not np.isfinite(end) or start < 0 or end <= start:
+                raise ValueError(f"Invalid annotated event interval for sample {row.get('sample_id', '<unknown>')}: "
+                                 f"[{start}, {end}); expected finite values, 0 <= time_start, and time_end > time_start")
+            video_start, video_end = start, end
         audio, coverage = self._read_audio(audio_path, start, end)
         video_path = self._path(row["video_path"])
+        video = self._read_video(video_path, video_start, video_end)
         return {
             "modality_1": audio,
-            "modality_2": self._read_video(video_path, start, end),
+            "modality_2": video,
             "label": torch.tensor(int(row["label_id"]), dtype=torch.long),
             "sample_id": row["sample_id"], "source_id": row["video_id"],
             "label_name": row["label"], "split": row["split"],
             "split_protocol": self.split_protocol,
             "temporal_window_policy": self.temporal_window_policy,
             "audio_valid_fraction": coverage,
+            "annotation_time_start": row.get("time_start"),
+            "annotation_time_end": row.get("time_end"),
             "time_start": start, "time_end": end,
         }
 
