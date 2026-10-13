@@ -24,7 +24,11 @@ class AVEDataset(Dataset):
                  audio_samples: int = 160_000, split_protocol: str = "official",
                  temporal_window_policy: str = "full_clip",
                  min_audio_coverage: float = 0.5) -> None:
-        self.manifest_path = Path(manifest_path).resolve()
+        project_root = Path(__file__).resolve().parents[2]
+        self.manifest_path = Path(manifest_path)
+        if not self.manifest_path.is_absolute():
+            self.manifest_path = project_root / self.manifest_path
+        self.manifest_path = self.manifest_path.resolve()
         if split_protocol not in {"official", "source_video_disjoint"}:
             raise ValueError("split_protocol must be 'official' or 'source_video_disjoint'")
         if split_protocol == "source_video_disjoint":
@@ -38,7 +42,10 @@ class AVEDataset(Dataset):
                 raise FileNotFoundError(f"Source-video-disjoint manifest not found: {alternative}; "
                                         "run prepare_ave_manifest.py --include-source-video-disjoint")
             self.manifest_path = alternative
-        self.root = Path(root).resolve() if root else self.manifest_path.parents[4]
+        self.root = Path(root) if root else project_root
+        if not self.root.is_absolute():
+            self.root = project_root / self.root
+        self.root = self.root.resolve()
         self.num_frames, self.image_size = num_frames, image_size
         self.sample_rate, self.audio_samples = sample_rate, audio_samples
         self.split_protocol = split_protocol
@@ -72,7 +79,7 @@ class AVEDataset(Dataset):
         self.labels = [int(row["label_id"]) for row in self.rows]
         self.sample_ids = [row["sample_id"] for row in self.rows]
         self.source_ids = [row["video_id"] for row in self.rows]
-        self.metadata = {"dataset_name": "ave", "adapter": "ave_mm.dataset:AVEDataset",
+        self.metadata = {"dataset_name": "ave", "adapter": "ave",
                          "manifest_path": str(self.manifest_path), "manifest_sha256": file_sha256(self.manifest_path),
                          "split": split, "split_protocol": self.split_protocol,
                          "class_to_id": self.class_to_id,

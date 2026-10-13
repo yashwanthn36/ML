@@ -1,0 +1,92 @@
+# Copy into an experiment config and set manifest_path/media_root for your data.
+seed: 17
+device: auto
+output_dir: outputs/<dataset>/<protocol>
+training_conditions: [reference, ci_only, proposed_ci_mi]
+dataset:
+  name: my_dataset
+  adapter: generic_audio_video
+  factory: multimodal.data_adapters.generic_audio_video:build_datasets
+  split_protocol: official
+  require_source_disjoint: false
+  kwargs:
+    manifest_path: data/manifests/my_dataset/paired_av.csv
+    media_root: data/raw/my_dataset
+    media_paths_relative_to: media_root
+    dataset_name: my_dataset
+    train_split: train
+    validation_split: val
+    columns:
+      sample_id: sample_id
+      audio_path: audio_path
+      video_path: video_path
+      label: label
+      source_id: source_id
+      split: split
+    # Optional stable mapping. If omitted, class names are sorted once from
+    # the whole manifest and shared by train, validation, and test datasets.
+    # class_mapping: {class_a: 0, class_b: 1, class_c: 2}
+    num_frames: 8
+    image_size: 224
+    sample_rate: 16000
+    audio_samples: 160000
+    min_audio_coverage: 0.5
+test_dataset:
+  name: my_dataset
+  adapter: generic_audio_video
+  factory: multimodal.data_adapters.generic_audio_video:build_test_dataset
+  split_protocol: official
+  require_source_disjoint: false
+  kwargs:
+    manifest_path: data/manifests/my_dataset/paired_av.csv
+    media_root: data/raw/my_dataset
+    media_paths_relative_to: media_root
+    dataset_name: my_dataset
+    test_split: test
+    columns:
+      sample_id: sample_id
+      audio_path: audio_path
+      video_path: video_path
+      label: label
+      source_id: source_id
+      split: split
+    num_frames: 8
+    image_size: 224
+    sample_rate: 16000
+    audio_samples: 160000
+    min_audio_coverage: 0.5
+model:
+  factory: multimodal.models:build_model
+  kwargs:
+    dim: 128
+    heads: 4
+    encoder_1: {name: panns_cnn14, kwargs: {input_sample_rate: 16000, pretrained: true, freeze: true}}
+    encoder_2: {name: resnet18, kwargs: {pretrained: true, freeze: true}}
+    freeze_encoders: true
+contribution:
+  estimator: utopia_mutual_information
+  fcd_factory: multimodal.contribution.fcd:InfoNCEFCD
+  target_estimator: risk_based
+  target_granularity: global
+  epsilon: 1.0e-8
+  fcd_kwargs: {queue_size: 1024}
+  bootstrap_replicates: 200
+  max_bootstrap_std: 0.15
+  target_min_support: 20
+  min_group_support_floor: 20
+  max_groups_per_class: 3
+evaluation:
+  minority_bottom_quantile: 0.25
+training:
+  batch_size: 8
+  num_workers: 0
+  epochs: 30
+  early_stopping_patience: 5
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  modality_dropout: 0.2
+  contribution_estimation_fraction: 0.2
+  optimization_mode: fixed_weight
+  ci_objective: class_balanced
+  lambda_mi_grid: [0.01, 0.1, 1.0, 10.0]
+  grad_clip: 1.0

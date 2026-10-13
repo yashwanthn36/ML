@@ -20,9 +20,10 @@ from multimodal.training.selection import select_validation_macro_f1
 from multimodal.training.device import select_device
 from multimodal.training.provenance import (effective_split_protocol, file_sha256, ids_hash,
     validate_checkpoint, validate_downstream_artifact, configured_split_protocol,
-    ensure_protocol_output)
+    ensure_protocol_output, requires_source_disjoint)
 from multimodal.data_adapters.contract import validate_split_datasets
 from multimodal.training.reference import seed_data_worker
+from multimodal.training.configuration import validate_pipeline_config
 
 
 def load_factory(spec: str):
@@ -45,6 +46,7 @@ def main() -> None:
     args = parser.parse_args()
     config_path = args.config if args.config.is_absolute() else PROJECT_ROOT / args.config
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    validate_pipeline_config(config, path=config_path)
     configured_protocol = configured_split_protocol(config)
     if args.device:
         config["device"] = args.device
@@ -58,7 +60,7 @@ def main() -> None:
     train_set, validation_set = dataset_factory(**dataset_kwargs)
     split_protocol = effective_split_protocol(train_set, configured_protocol)
     validate_split_datasets(train_set, validation_set,
-        require_source_disjoint=(split_protocol == "source_video_disjoint" or split_protocol.endswith("_source_disjoint")))
+        require_source_disjoint=requires_source_disjoint(config, split_protocol))
     loader_args = {"batch_size": int(training_cfg["batch_size"]),
                    "num_workers": int(training_cfg["num_workers"]),
                    "pin_memory": device.type == "cuda"}

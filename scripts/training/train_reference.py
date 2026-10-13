@@ -17,8 +17,9 @@ from multimodal.training.reference import seed_data_worker
 from multimodal.data_adapters.contract import validate_split_datasets
 from multimodal.training.splits import grouped_reference_holdout
 from multimodal.training.provenance import (make_run_provenance, configured_split_protocol,
-    effective_split_protocol, ensure_protocol_output)
+    effective_split_protocol, ensure_protocol_output, requires_source_disjoint)
 from multimodal.training.device import select_device
+from multimodal.training.configuration import validate_pipeline_config
 
 
 def load_factory(spec: str):
@@ -33,6 +34,7 @@ def main() -> None:
     args = parser.parse_args()
     config_path = args.config if args.config.is_absolute() else PROJECT_ROOT / args.config
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    validate_pipeline_config(config, path=config_path)
     configured_protocol = configured_split_protocol(config)
     if args.device:
         config["device"] = args.device
@@ -46,9 +48,8 @@ def main() -> None:
         dataset_kwargs["split_protocol"] = dataset_cfg["split_protocol"]
     train_set, validation_set = load_factory(dataset_cfg["factory"])(**dataset_kwargs)
     effective_split_protocol(train_set, configured_protocol)
-    require_source_disjoint = configured_protocol == "source_video_disjoint" or configured_protocol.endswith("_source_disjoint")
     contract = validate_split_datasets(train_set, validation_set,
-                                       require_source_disjoint=require_source_disjoint)
+        require_source_disjoint=requires_source_disjoint(config, configured_protocol))
     training_cfg = config["training"]
     estimation_fraction = float(training_cfg.get("contribution_estimation_fraction", 0.2))
     if not 0.0 <= estimation_fraction < 1.0:
@@ -109,7 +110,10 @@ def main() -> None:
     )
     checkpoint = train_reference(model, train_loader, validation_loader,
                                  training=training_cfg, run_dir=output, seed=seed, config=config,
-                                 data_metadata={**contribution_metadata, "provenance": run_provenance},
+                                 data_metadata={**contribution_metadata, "provenance": run_provenance,
+                                                "dataset_metadata": getattr(train_set, "metadata", {}),
+                                                "dataset_contract": contract,
+                                                "class_to_id": train_set.class_to_id},
                                  device=selected_device)
     print(f"selected checkpoint: {checkpoint}")
 

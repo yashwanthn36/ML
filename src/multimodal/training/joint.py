@@ -104,6 +104,8 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
     run_metadata = experiment_metadata(config)
     run_metadata["device"] = str(device)
     run_metadata["model_condition"] = model_condition
+    run_metadata["dataset_metadata"] = reference_checkpoint.get("data_metadata", {}).get("dataset_metadata", {})
+    run_metadata["class_to_id"] = reference_checkpoint.get("data_metadata", {}).get("class_to_id", {})
     (run_dir / "experiment_metadata.json").write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
     run_provenance = {**(reference_checkpoint.get("run_provenance") or {}),
                       "reference_checkpoint_sha256": reference_checkpoint_sha256}

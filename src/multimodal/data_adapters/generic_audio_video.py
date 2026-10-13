@@ -23,6 +23,7 @@ from multimodal.data_adapters.media import read_video_frames
 
 DEFAULT_COLUMNS = {"sample_id": "sample_id", "audio_path": "audio_path", "video_path": "video_path",
                    "label": "label", "source_id": "source_id", "split": "split"}
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 class GenericAudioVideoDataset(Dataset):
@@ -32,20 +33,24 @@ class GenericAudioVideoDataset(Dataset):
                  columns: dict[str, str] | None = None, class_mapping: dict[str, int] | None = None,
                  num_frames: int = 8, image_size: int = 224, sample_rate: int = 16_000,
                  audio_samples: int = 160_000, min_audio_coverage: float = 0.5,
-                 split_protocol: str = "manifest", manifest_relative_to: str = "manifest",
+                 split_protocol: str = "manifest", media_paths_relative_to: str = "media_root",
                  dataset_name: str = "generic_av") -> None:
-        self.manifest_path = Path(manifest_path).expanduser().resolve()
+        self.manifest_path = Path(manifest_path).expanduser()
+        if not self.manifest_path.is_absolute():
+            self.manifest_path = PROJECT_ROOT / self.manifest_path
+        self.manifest_path = self.manifest_path.resolve()
         if not self.manifest_path.is_file():
             raise FileNotFoundError(f"Dataset manifest does not exist: {self.manifest_path}")
-        if manifest_relative_to not in {"manifest", "media_root"}:
-            raise ValueError("manifest_relative_to must be 'manifest' or 'media_root'")
+        if media_paths_relative_to not in {"manifest", "media_root"}:
+            raise ValueError("media_paths_relative_to must be 'manifest' or 'media_root'")
         if num_frames <= 0 or image_size <= 0 or sample_rate <= 0 or audio_samples <= 0:
             raise ValueError("num_frames, image_size, sample_rate and audio_samples must be positive")
         if not 0 <= min_audio_coverage <= 1:
             raise ValueError("min_audio_coverage must be in [0, 1]")
         self.media_root = Path(media_root).expanduser()
         if not self.media_root.is_absolute():
-            self.media_root = (self.manifest_path.parent / self.media_root).resolve()
+            self.media_root = (PROJECT_ROOT / self.media_root).resolve()
+        self.media_paths_relative_to = media_paths_relative_to
         self.columns = {**DEFAULT_COLUMNS, **(columns or {})}
         self.num_frames, self.image_size = int(num_frames), int(image_size)
         self.sample_rate, self.audio_samples = int(sample_rate), int(audio_samples)
@@ -68,6 +73,8 @@ class GenericAudioVideoDataset(Dataset):
             assigned = [row for row in all_rows if row[self.columns["split"]].strip() == self.split]
         else:
             raise ValueError("Manifest has no split column; run split_manifest.py to generate explicit assignments")
+        if any(not row[self.columns["split"]].strip() for row in all_rows):
+            raise ValueError(f"Manifest has one or more rows with empty split assignments: {self.manifest_path}")
         if not assigned:
             raise ValueError(f"No samples assigned to split {split!r} in {self.manifest_path}")
         labels = sorted({row[self.columns["label"]].strip() for row in all_rows})
@@ -90,6 +97,19 @@ class GenericAudioVideoDataset(Dataset):
             raise ValueError(f"Sample IDs must be non-empty and globally unique in {self.manifest_path}")
         self.sample_ids = [self._value(row, "sample_id") for row in assigned]
         self.labels = [class_mapping[self._value(row, "label")] for row in assigned]
+        missing_media = []
+        for row in assigned:
+            sample_id = self._value(row, "sample_id")
+            for logical in ("audio_path", "video_path"):
+                value = self._value(row, logical)
+                if not value:
+                    missing_media.append(f"{sample_id}: empty {logical}")
+                    continue
+                if not self._resolve(value).is_file():
+                    missing_media.append(f"{sample_id}: missing {logical}={self._resolve(value)}")
+        if missing_media:
+            raise FileNotFoundError(f"Missing media referenced by {self.split} partition in {self.manifest_path}: "
+                                    + "; ".join(missing_media[:8]))
         source_column = self.columns["source_id"]
         self.source_ids = ([row.get(source_column, "").strip() for row in assigned]
                            if source_column in self.manifest_columns and
@@ -101,7 +121,9 @@ class GenericAudioVideoDataset(Dataset):
                          "class_to_id": self.class_to_id,
                          "preprocessing": {"audio_format": "PCM WAV", "sample_rate": self.sample_rate,
                                            "audio_samples": self.audio_samples, "num_frames": self.num_frames,
-                                           "image_size": self.image_size},
+                                           "image_size": self.image_size,
+                                           "audio_resampling": "linear interpolation",
+                                           "video_sampling": "uniform over available duration"},
                          "usable_samples": len(assigned)}
 
     def _value(self, row: dict[str, str], key: str) -> str:
@@ -111,8 +133,8 @@ class GenericAudioVideoDataset(Dataset):
         path = Path(value).expanduser()
         if path.is_absolute():
             return path
-        # Relative paths are rooted at media_root. Absolute paths remain absolute.
-        return (self.media_root / path).resolve()
+        base = self.manifest_path.parent if self.media_paths_relative_to == "manifest" else self.media_root
+        return (base / path).resolve()
 
     def _read_audio(self, path: Path) -> tuple[torch.Tensor, float]:
         try:
@@ -172,7 +194,7 @@ class GenericAudioVideoDataset(Dataset):
                 "split_protocol": self.split_protocol, "audio_valid_fraction": coverage,
                 "audio_path": str(audio_path), "video_path": str(video_path)}
         source_id = self._value(row, "source_id")
-        if source_id:
+        if self.source_ids is not None:
             item["source_id"] = source_id
         return item
 

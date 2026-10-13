@@ -3,7 +3,11 @@ device: auto
 evaluation:
   minority_bottom_quantile: 0.25
 output_dir: outputs/ave/source_video_disjoint
+training_conditions: [reference, ci_only, proposed_ci_mi]
 dataset:
+  name: ave
+  adapter: ave
+  require_source_disjoint: true
   factory: ave_mm.dataset:build_datasets
   split_protocol: source_video_disjoint
   kwargs:
@@ -16,6 +20,9 @@ dataset:
     temporal_window_policy: full_clip
     min_audio_coverage: 0.5
 test_dataset:
+  name: ave
+  adapter: ave
+  require_source_disjoint: true
   factory: ave_mm.dataset:build_test_dataset
   split_protocol: source_video_disjoint
   kwargs:

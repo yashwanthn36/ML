@@ -15,16 +15,16 @@ from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
-from multimodal.contribution.fcd import InfoNCEFCD
 from multimodal.losses.alignment import target_to_current_kl
 from multimodal.training.classification_metrics import (classification_metrics,
     identify_minority_classes, validate_probabilities)
 from multimodal.training.device import assert_module_device, select_device, on_device
 from multimodal.training.provenance import (effective_split_protocol, validate_checkpoint,
     validate_downstream_artifact, file_sha256, config_hash, configured_split_protocol,
-    ensure_protocol_output)
+    ensure_protocol_output, requires_source_disjoint)
 from multimodal.data_adapters.contract import validate_split_datasets
 from multimodal.training.reference import seed_data_worker
+from multimodal.training.configuration import validate_pipeline_config
 
 
 def load_factory(spec: str):
@@ -54,6 +54,7 @@ def main() -> None:
     args = parser.parse_args()
     config_path = args.config if args.config.is_absolute() else PROJECT_ROOT / args.config
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    validate_pipeline_config(config, path=config_path)
     configured_protocol = configured_split_protocol(config)
     if args.device:
         config["device"] = args.device
@@ -81,8 +82,8 @@ def main() -> None:
     split_protocol = effective_split_protocol(test_set, configured_protocol)
     if split_protocol != training_protocol:
         raise ValueError(f"Training/test protocol mismatch: training uses {training_protocol!r}, test uses {split_protocol!r}")
-    validate_split_datasets(train_set, validation_set, test_set,
-        require_source_disjoint=(split_protocol == "source_video_disjoint" or split_protocol.endswith("_source_disjoint")))
+    split_contract = validate_split_datasets(train_set, validation_set, test_set,
+        require_source_disjoint=requires_source_disjoint(config, split_protocol))
     if int(train_set.num_classes) != int(test_set.num_classes):
         raise ValueError(f"Training/test class-count mismatch: {train_set.num_classes} vs {test_set.num_classes}")
     class_names = _class_names(test_set)
@@ -184,11 +185,15 @@ def main() -> None:
 
     source_1, source_2 = torch.cat(modality_1_rows), torch.cat(modality_2_rows)
     fused_all = torch.cat(fused_rows)
-    fcd_estimator = InfoNCEFCD(float(config.get("contribution", {}).get("epsilon", 1e-8)),
-                               **{**config.get("contribution", {}).get("fcd_kwargs", {}), "queue_size": 0})
+    contribution_cfg = config.get("contribution", {})
+    fcd_spec = contribution_cfg.get("fcd_factory")
+    if not fcd_spec:
+        raise ValueError("Set contribution.fcd_factory to the configured evaluation MI estimator")
+    fcd_estimator = load_factory(fcd_spec)(float(contribution_cfg.get("epsilon", 1e-8)),
+        **{**contribution_cfg.get("fcd_kwargs", {}), "queue_size": 0})
     fcd_information = fcd_estimator.per_sample_information(fused_all, source_1, source_2,
         sample_ids=ids if len(ids) == len(fused_all) else None,
-        source_ids=sources if len(sources) == len(fused_all) else None)
+        source_ids=sources if getattr(test_set, "source_ids", None) is not None else None)
     fcd = fcd_estimator.distribution(fcd_information)
     metrics["fcd_test"] = fcd.tolist()
     if args.targets:
@@ -222,6 +227,7 @@ def main() -> None:
         "dataset_adapter": getattr(train_set, "metadata", {}).get("adapter", config["dataset"].get("adapter")),
         "dataset_metadata": getattr(train_set, "metadata", {}),
         "class_to_id": {str(key): int(value) for key, value in train_set.class_to_id.items()},
+        "split_contract": split_contract,
     })
     (output_dir / "test_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print(f"saved final test results under {output_dir}")

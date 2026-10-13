@@ -72,7 +72,9 @@ def make_run_provenance(*, split_protocol: str, seed: int, run_id: str,
         "dataset_name": dataset_metadata.get("dataset_name", config.get("dataset", {}).get("name")),
         "dataset_adapter": dataset_metadata.get("adapter", config.get("dataset", {}).get("adapter")),
         "dataset_manifest_sha256": dataset_metadata.get("manifest_sha256"),
-        "class_to_id": class_to_id or dataset_metadata.get("class_to_id"),
+        "split_assignments_sha256": dataset_metadata.get("manifest_sha256"),
+        "class_to_id": ({str(key): int(value) for key, value in (class_to_id or dataset_metadata.get("class_to_id", {})).items()}
+                        if class_to_id or dataset_metadata.get("class_to_id") else None),
     }
 
 
@@ -88,6 +90,7 @@ def validate_checkpoint(checkpoint: dict[str, Any], *, split_protocol: str, seed
         expected["training_sample_ids_sha256"] = ids_hash(training_sample_ids)
     if dataset_metadata is not None:
         expected.update({"dataset_manifest_sha256": dataset_metadata.get("manifest_sha256"),
+                         "split_assignments_sha256": dataset_metadata.get("manifest_sha256"),
                          "dataset_name": dataset_metadata.get("dataset_name"),
                          "dataset_adapter": dataset_metadata.get("adapter")})
     if class_to_id is not None:
@@ -110,7 +113,8 @@ def validate_downstream_artifact(provenance: dict[str, Any] | None, *,
     expected = {key: reference_provenance.get(key) for key in
                 ("split_protocol", "seed", "run_id", "training_sample_ids_sha256",
                  "estimation_sample_ids_sha256", "experiment_config_sha256",
-                 "dataset_name", "dataset_adapter", "dataset_manifest_sha256", "class_to_id")
+                 "dataset_name", "dataset_adapter", "dataset_manifest_sha256",
+                 "split_assignments_sha256", "class_to_id")}
     expected["reference_checkpoint_sha256"] = reference_sha256
     validate_provenance(expected, provenance, artifact=artifact, allow_legacy=allow_legacy,
                         required_keys=tuple(expected))
@@ -137,6 +141,15 @@ def configured_split_protocol(config: dict[str, Any]) -> str:
         raise ValueError(f"Config split-protocol mismatch: dataset.split_protocol expects "
                          f"{dataset_protocol!r}, test_dataset.split_protocol is {test_protocol!r}")
     return str(dataset_protocol)
+
+
+def requires_source_disjoint(config: dict[str, Any], protocol: str | None = None) -> bool:
+    """Resolve source independence from explicit config, with AVE legacy fallback."""
+    dataset = config.get("dataset", {})
+    if "require_source_disjoint" in dataset:
+        return bool(dataset["require_source_disjoint"])
+    actual = protocol or dataset.get("split_protocol")
+    return actual == "source_video_disjoint"
 
 
 def ensure_protocol_output(directory: str | Path, *, split_protocol: str, seed: int) -> Path:

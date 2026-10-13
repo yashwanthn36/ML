@@ -18,9 +18,10 @@ from multimodal.grouping import cluster_profiles
 from multimodal.training.device import select_device
 from multimodal.training.provenance import (checkpoint_provenance, effective_split_protocol,
     file_sha256, validate_checkpoint, validate_provenance, configured_split_protocol,
-    ensure_protocol_output)
-from multimodal.data_adapters.contract import validate_dataset
+    ensure_protocol_output, requires_source_disjoint)
+from multimodal.data_adapters.contract import validate_dataset, validate_split_datasets
 from multimodal.training.reference import seed_data_worker
+from multimodal.training.configuration import validate_pipeline_config
 
 
 def load_factory(spec: str):
@@ -40,6 +41,7 @@ def main() -> None:
     args = parser.parse_args()
     config_path = args.config if args.config.is_absolute() else PROJECT_ROOT / args.config
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    validate_pipeline_config(config, path=config_path)
     configured_protocol = configured_split_protocol(config)
     if args.device:
         config["device"] = args.device
@@ -48,9 +50,11 @@ def main() -> None:
     dataset_kwargs = dict(dataset_cfg.get("kwargs", {}))
     if "split_protocol" in dataset_cfg:
         dataset_kwargs["split_protocol"] = dataset_cfg["split_protocol"]
-    train_set, _ = load_factory(dataset_cfg["factory"])(**dataset_kwargs)
+    train_set, validation_set = load_factory(dataset_cfg["factory"])(**dataset_kwargs)
     split_protocol = effective_split_protocol(train_set, configured_protocol)
     validate_dataset(train_set, name="training")
+    validate_split_datasets(train_set, validation_set,
+        require_source_disjoint=requires_source_disjoint(config, split_protocol))
     checkpoint_path = args.checkpoint if args.checkpoint.is_absolute() else PROJECT_ROOT / args.checkpoint
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     ref_provenance = validate_checkpoint(checkpoint, split_protocol=split_protocol,

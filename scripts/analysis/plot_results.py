@@ -18,6 +18,7 @@ from sklearn.metrics import average_precision_score, precision_recall_curve
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 from multimodal.training.classification_metrics import validate_probabilities
+from multimodal.training.provenance import file_sha256
 
 MODELS = ("reference", "ci_only", "proposed_ci_mi")
 CONDITIONS = ("audio_video", "audio_only", "video_only")
@@ -125,9 +126,17 @@ def check_comparable(results: dict[str, list[dict]], protocol: str) -> tuple[lis
     names, minority, train_counts = (list(map(str, first["class_names"])),
         list(first["minority_class_definition"]["minority_class_ids"]),
         first["class_counts"]["train"])
+    dataset_identity = (first.get("dataset_name"), first.get("dataset_adapter"),
+                        (first.get("run_provenance") or {}).get("dataset_manifest_sha256"),
+                        (first.get("run_provenance") or {}).get("split_assignments_sha256"))
     for model in MODELS:
         for item in results[model]:
             metrics = item["metrics"]
+            current_identity = (metrics.get("dataset_name"), metrics.get("dataset_adapter"),
+                                (metrics.get("run_provenance") or {}).get("dataset_manifest_sha256"),
+                                (metrics.get("run_provenance") or {}).get("split_assignments_sha256"))
+            if current_identity != dataset_identity:
+                raise ValueError("Dataset identity or manifest hash differs across comparisons")
             if list(map(str, metrics["class_names"])) != names:
                 raise ValueError("Class-name mapping differs across model result files")
             definition = metrics.get("minority_class_definition", {})
@@ -152,7 +161,8 @@ def check_comparable(results: dict[str, list[dict]], protocol: str) -> tuple[lis
                 raise ValueError(f"{model} seed {seed} has mismatched run protocol/seed provenance")
             if provenance.get("reference_checkpoint_sha256") != reference_digest:
                 raise ValueError(f"{model} seed {seed} was not initialized from the evaluated reference checkpoint")
-            for key in ("training_sample_ids_sha256", "experiment_config_sha256"):
+                for key in ("training_sample_ids_sha256", "experiment_config_sha256", "dataset_manifest_sha256",
+                            "split_assignments_sha256", "class_to_id"):
                 expected_value = reference_provenance.get(key)
                 actual_value = provenance.get(key)
                 if not expected_value or actual_value != expected_value:
@@ -161,24 +171,48 @@ def check_comparable(results: dict[str, list[dict]], protocol: str) -> tuple[lis
     return names, minority, [int(train_counts[str(i)]) for i in range(len(names))]
 
 
-def manifest_counts(config: dict, protocol: str):
-    raw = config["dataset"]["kwargs"]["manifest_path"]
+def manifest_counts(config: dict, protocol: str, class_names: list[str]):
+    dataset = config["dataset"]
+    kwargs = dataset.get("kwargs", {})
+    raw = kwargs.get("manifest_path")
+    if not raw:
+        raise ValueError("Dataset config must declare dataset.kwargs.manifest_path for class-distribution reports")
     path = resolve(raw)
-    if protocol == "source_video_disjoint" and not path.stem.endswith("_source_video_disjoint"):
+    if dataset.get("adapter") == "ave" and protocol == "source_video_disjoint" and not path.stem.endswith("_source_video_disjoint"):
         path = path.with_name(path.stem + "_source_video_disjoint" + path.suffix)
     if not path.is_file():
         raise FileNotFoundError(f"Manifest required for class-distribution figure is missing: {path}")
-    counts: dict[str, dict[int, int]] = {split: defaultdict(int) for split in ("train", "val", "test")}
-    names: dict[int, str] = {}
+    columns = {"split": "split", "label": "label", "label_id": "label_id", **kwargs.get("columns", {})}
+    class_mapping = kwargs.get("class_mapping")
+    if class_mapping is None:
+        class_mapping = {name: index for index, name in enumerate(sorted(class_names))}
+    else:
+        class_mapping = {str(key): int(value) for key, value in class_mapping.items()}
+    split_names = {"train": kwargs.get("train_split", "train"),
+                   "val": kwargs.get("validation_split", "val"),
+                   "test": kwargs.get("test_split", "test")}
+    counts: dict[str, dict[int, int]] = {split: defaultdict(int) for split in split_names}
     with path.open("r", newline="", encoding="utf-8-sig") as stream:
-        for row in csv.DictReader(stream):
-            split, class_id = row["split"], int(row["label_id"])
-            if split in counts:
-                counts[split][class_id] += 1
-                names[class_id] = row["label"]
-    if not names:
-        raise ValueError(f"Manifest contains no labeled splits: {path}")
-    return path, counts, [names[i] for i in range(len(names))]
+        reader = csv.DictReader(stream)
+        absent = [column for column in (columns["split"], columns["label"]) if column not in (reader.fieldnames or [])]
+        if absent:
+            raise ValueError(f"Manifest {path} lacks configured report columns {absent}")
+        for row in reader:
+            split = row[columns["split"]]
+            split = next((key for key, value in split_names.items() if value == split), split)
+            if split not in counts:
+                continue
+            if dataset.get("adapter") == "ave" and columns["label_id"] in row and row[columns["label_id"]].strip():
+                class_id = int(row[columns["label_id"]])
+            else:
+                try:
+                    class_id = class_mapping[row[columns["label"]]]
+                except KeyError as error:
+                    raise ValueError(f"Unknown manifest label {row[columns['label']]!r} in {path}") from error
+            counts[split][class_id] += 1
+    if not any(counts.values()):
+        raise ValueError(f"Manifest contains no labeled partitions: {path}")
+    return path, counts, list(class_names)
 
 
 def save_figure(fig, directory: Path, stem: str):
@@ -212,7 +246,7 @@ def discover_targets(item: dict) -> Path | None:
 def create_figures(figdir: Path, config: dict, protocol: str, seed_label: str,
                    results: dict[str, list[dict]], names: list[str], minority: list[int],
                    train_counts: list[int], targets_override: dict[int, Path]):
-    manifest, split_counts, manifest_names = manifest_counts(config, protocol)
+    manifest, split_counts, manifest_names = manifest_counts(config, protocol, names)
     if manifest_names != names:
         raise ValueError(f"Manifest class order at {manifest} differs from evaluation class names")
     for model in MODELS:
@@ -238,7 +272,8 @@ def create_figures(figdir: Path, config: dict, protocol: str, seed_label: str,
         ax.bar(indices + (offset - 1) * width, values, width, label=split.title(), alpha=.9)
     ax.set_xticks(indices, names, rotation=65, ha="right", fontsize=8)
     ax.set_ylabel("Number of segments")
-    ax.set_title(f"AVE class distribution — {protocol} — class imbalance ratio {imbalance:.2f}:1")
+    dataset_name = config.get("dataset", {}).get("name", "Dataset")
+    ax.set_title(f"{dataset_name} class distribution — {protocol} — class imbalance ratio {imbalance:.2f}:1")
     ax.legend(title="Partition")
     ax.text(.99, .98, "Red class labels: minority classes selected from training counts only",
             transform=ax.transAxes, ha="right", va="top", fontsize=9)
@@ -438,7 +473,7 @@ def write_tables(outdir: Path, results: dict[str, list[dict]], names: list[str],
     for model in MODELS:
         for condition in CONDITIONS:
             aggregate = aggregate_metrics(results[model], condition)
-        rows.append({"model": DISPLAY[model], "model_condition": model,
+            rows.append({"model": DISPLAY[model], "model_condition": model,
                          "evaluation_condition": condition,
                          **{key: mean for key, (mean, _) in aggregate.items()},
                          **{key + "_std": std for key, (_, std) in aggregate.items()},
@@ -448,7 +483,8 @@ def write_tables(outdir: Path, results: dict[str, list[dict]], names: list[str],
     fields = list(rows[0])
     with (outdir / "summary_metrics.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader(); writer.writerows(rows)
-    md = [f"# AVE results — {protocol}", "", "Metrics come only from the supplied completed evaluations.",
+    dataset_name = results[MODELS[0]][0]["metrics"].get("dataset_name", "Dataset")
+    md = [f"# {dataset_name} results — {protocol}", "", "Metrics come only from the supplied completed evaluations.",
           "Single-seed values are not multi-seed averages. Multi-seed values show mean ± sample standard deviation.", "",
           "| Model | Condition | Accuracy | Macro-F1 | Balanced accuracy | Macro precision | Minority macro-F1 | Minority macro-recall | Seeds |",
           "|---|---|---:|---:|---:|---:|---:|---:|---|"]
@@ -484,16 +520,19 @@ def write_tables(outdir: Path, results: dict[str, list[dict]], names: list[str],
 
 def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--protocol", choices=("official", "source_video_disjoint"), required=True)
+    parser.add_argument("--protocol", required=True, help="Configured dataset split protocol")
     parser.add_argument("--seed", type=int, help="Select one seed; omit to aggregate matching completed seeds")
-    parser.add_argument("--config", type=Path, help="Protocol YAML; defaults to the matching AVE config")
+    parser.add_argument("--config", type=Path, help="Experiment YAML; defaults exist for the two AVE protocols")
     parser.add_argument("--result", action="append", required=True,
                         help="Completed result as MODEL=path/to/test_metrics.json; repeat for each model/seed")
     parser.add_argument("--targets", action="append",
                         help="Optional UCD targets for Figure 7; use SEED=PATH when aggregating seeds")
     parser.add_argument("--output-dir", type=Path, help="Override protocol report directory")
     args = parser.parse_args(argv)
-    default_cfg = f"configs/ave_{'official' if args.protocol == 'official' else 'source_video_disjoint'}.yaml"
+    default_cfg = {"official": "configs/ave_official.yaml",
+                   "source_video_disjoint": "configs/ave_source_video_disjoint.yaml"}.get(args.protocol)
+    if args.config is None and default_cfg is None:
+        raise ValueError("--config is required for protocols without a built-in AVE configuration")
     cfg_path = resolve(args.config or default_cfg)
     if not cfg_path.is_file():
         raise FileNotFoundError(f"Protocol config does not exist: {cfg_path}")
@@ -503,6 +542,21 @@ def main(argv: list[str] | None = None):
         raise ValueError(f"Config {cfg_path} training/test protocols do not both match {args.protocol!r}")
     results = parse_results(args.result, args.protocol, args.seed)
     names, minority, train_counts = check_comparable(results, args.protocol)
+    manifest, _, _ = manifest_counts(config, args.protocol, names)
+    expected_manifest_sha = file_sha256(manifest)
+    for model in MODELS:
+        for item in results[model]:
+            metrics = item["metrics"]
+            if metrics.get("dataset_name") != config["dataset"].get("name"):
+                raise ValueError(f"{item['metrics_path']} dataset_name does not match report config")
+            if metrics.get("dataset_adapter") != config["dataset"].get("adapter"):
+                raise ValueError(f"{item['metrics_path']} dataset_adapter does not match report config")
+            actual_manifest_sha = (metrics.get("run_provenance") or {}).get("dataset_manifest_sha256")
+            if actual_manifest_sha != expected_manifest_sha:
+                raise ValueError(f"{item['metrics_path']} manifest hash does not match configured manifest {manifest}")
+            actual_split_sha = (metrics.get("run_provenance") or {}).get("split_assignments_sha256")
+            if actual_split_sha != expected_manifest_sha:
+                raise ValueError(f"{item['metrics_path']} split-assignment hash does not match configured manifest {manifest}")
     seeds = sorted({item["seed"] for model in MODELS for item in results[model]})
     if args.seed is not None and seeds != [args.seed]:
         raise ValueError(f"Expected only seed {args.seed}, found {seeds}")
@@ -542,7 +596,12 @@ def main(argv: list[str] | None = None):
     summary_rows, per_class_rows = write_tables(outdir, results, names, args.protocol)
     create_figures(figdir, config, args.protocol, ", ".join(map(str, seeds)), results,
                    names, minority, train_counts, target_paths)
-    summary = {"protocol": args.protocol, "seeds": seeds,
+    summary = {"dataset_name": config.get("dataset", {}).get("name"),
+        "dataset_adapter": config.get("dataset", {}).get("adapter"),
+        "protocol": args.protocol, "seeds": seeds,
+        "class_names": names,
+        "class_to_id": {name: class_id for class_id, name in enumerate(names)},
+        "dataset_manifest_sha256": (results[MODELS[0]][0]["metrics"].get("run_provenance") or {}).get("dataset_manifest_sha256"),
         "aggregation": "single_seed" if len(seeds) == 1 else "mean and sample standard deviation across seeds",
         "model_conditions": {model: [{"seed": item["seed"],
             "metrics_path": str(item["metrics_path"]),

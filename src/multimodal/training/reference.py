@@ -96,6 +96,8 @@ def train_reference(model: nn.Module, train_loader: DataLoader, validation_loade
     run_metadata = experiment_metadata(config)
     run_metadata["device"] = str(device)
     run_metadata["model_condition"] = "reference"
+    run_metadata["dataset_metadata"] = (data_metadata or {}).get("dataset_metadata", {})
+    run_metadata["class_to_id"] = (data_metadata or {}).get("class_to_id", {})
     (run_dir / "experiment_metadata.json").write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
     try:
         for epoch in range(1, int(training["epochs"]) + 1):

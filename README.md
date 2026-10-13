@@ -1,6 +1,6 @@
 # Contribution-profile-aware multimodal learning
 
-This repository contains a reusable two-modality learning pipeline and an AVE adapter. It implements contribution signatures, contribution-profile grouping, risk-based UCD targets, Utopia-style mutual-information FCD estimates, class/group-balanced losses, and fixed-weight or minimum-norm two-objective training. The architecture reference is `implementatation/contribution_profile_multimodal_architecture_redesigned.pdf`; the FCD equations are checked against `implementatation/1-s2.0-S1566253525004567-main.pdf`.
+This repository contains a reusable two-modality learning pipeline and an AVE adapter. It implements contribution signatures, contribution-profile grouping, risk-based UCD targets, Utopia-style mutual-information FCD estimates, class/group-balanced losses, and fixed-weight or minimum-norm two-objective training. The architecture reference is `references/contribution_profile_multimodal_architecture_redesigned.pdf`; the FCD equations are checked against `references/1-s2.0-S1566253525004567-main.pdf`.
 
 ## Setup
 
@@ -13,6 +13,8 @@ python -m pip install -r requirements.txt
 ```
 
 Alternatively, run `.venv\Scripts\python.exe` without activating. `requirements.txt` includes PyTorch, torchvision, torchaudio, PANNs inference, OpenCV, scikit-learn, PyYAML, imageio-ffmpeg, and pytest.
+
+For an editable package install from the repository root, use `python -m pip install -e ".[dev]"`. `requirements.txt` pins this workstation's CUDA 12.8 stack; `pyproject.toml` declares portable dependency ranges for editable installs. There is no cross-platform lock file because the supported PyTorch wheel differs by operating system and accelerator.
 
 The AVE media and archive are excluded from Git because they require several gigabytes. Place the archive at `data/raw/AVE/ave.zip` and extracted tracks at `data/raw/AVE/ave/audio/` and `data/raw/AVE/ave/video/`. The manifest and split metadata are tracked. Rebuild manifests from archive metadata with:
 
@@ -157,4 +159,42 @@ python scripts/data/prepare_ave_manifest.py --help
 python scripts/analysis/plot_results.py --help
 ```
 
-The current reliability suite exercises metric serialization, CI-only behavior, validation-only lambda selection, and report generation for both protocols. The exact command `python -m pytest -q -p no:cacheprovider tests` passed 36 tests in this implementation pass; `python -m compileall -q src scripts tests` checks compilation. A real AVE decode of `train_0063` under `full_clip` succeeded and preserved its original zero timestamps; `annotated_event` rejected it as expected. A small CUDA forward/backward smoke ran on an RTX 3050 with CUDA 12.8. No full pretrained-model training or 30-epoch experiment has been run. Therefore no classification performance result or improvement claim exists until the three training conditions and their evaluations finish. The official protocol retains known source overlap; consult the selected protocol when interpreting results.
+Before the dataset-agnostic refactor, `python -m pytest -q -p no:cacheprovider tests` passed 36 tests, Python compilation and CLI help checks passed, and a real AVE `train_0063` media smoke check succeeded for `full_clip` and rejected the zero-length event interval under `annotated_event`. This refactor adds a separate synthetic integration test; its current execution was interrupted before completion, so it is not yet verified. No full pretrained-model training or 30-epoch experiment has been run and no classification improvement is claimed. The official protocol retains known source overlap; consult the selected protocol when interpreting results.
+
+## Reusing the pipeline with another dataset
+
+Training, contribution estimation, evaluation, and reporting use the paired dataset contract documented in [docs/architecture.md](docs/architecture.md). The AVE reader remains AVE-specific; `multimodal.data_adapters.generic_audio_video` is the reusable manifest-backed adapter. It accepts arbitrary class names and counts, configurable column names, explicit train/validation/test assignments, optional source IDs, relative or absolute WAV/video paths, and preprocessing parameters. Relative manifest and media-root configuration paths resolve from the repository root. Relative media paths default to `media_root`; use `media_paths_relative_to: manifest` to resolve against the CSV directory.
+
+The generic media implementation supports uncompressed PCM WAV (8/16/24/32-bit) and OpenCV-decodable videos. Audio is converted to mono, linearly resampled, then padded or truncated to the configured window. Video is uniformly sampled over available clip duration. Corrupt or unsupported files fail with a sample/path error. Compressed audio and non-video modalities require a dataset-specific adapter; see [docs/dataset_adapter_guide.md](docs/dataset_adapter_guide.md). The complete copyable model/experiment config is [configs/datasets/dataset_template.yaml](configs/datasets/dataset_template.yaml).
+
+For data without official assignments, generate a new split manifest; the utility never overwrites a populated split manifest or the input:
+
+```powershell
+python scripts/data/split_manifest.py --input data/manifests/my_dataset/unsplit.csv --output data/manifests/my_dataset/split_seed_17.csv --seed 17
+```
+
+By default it uses source-grouped deterministic splitting and fails when source IDs are missing. The sidecar reports per-class support and limitations because group constraints can make stratification impossible. Explicitly pass `--allow-sample-level` to stratify by sample when source IDs are unavailable or source overlap is acceptable; that protocol can share recordings across splits. Use a dataset-specific protocol name and preserve official split assignments.
+
+Once an external dataset has its manifest/media and a config based on the template, the same `train_reference.py`, `estimate_contributions.py`, `train_joint.py`, `evaluate_test.py`, and `plot_results.py` commands apply. For example, set `$cfg = "configs/datasets/my_dataset.yaml"` and `$root = "outputs/my_dataset/official/seed_17"`, then use the official workflow above with `--config $cfg`; pass the configured protocol string and config explicitly to the report command. Outputs are organized as `outputs/<dataset>/<protocol>/seed_<seed>/` with reference, contributions, CI-only, proposed, evaluations, and reports. Dataset identity, manifest/split hash, class mapping, seed, checkpoint identity, and config provenance are checked before results can be compared.
+
+The tiny offline synthetic integration test exercises all three conditions, contribution artifacts, all three evaluation masks, reports, protocol mismatch rejection, and deterministic split metadata without pretrained downloads:
+
+```powershell
+python -m pytest -q -p no:cacheprovider tests/integration/test_generic_pipeline.py
+```
+
+This uses locally generated PCM WAV/MJPEG fixtures and lightweight `audio_cnn`/`frame_cnn` encoders. It tests pipeline compatibility, not the AVE pretrained PANNs/ResNet encoders or production classification performance. The repository audit checklist is [docs/audit_checklist.md](docs/audit_checklist.md).
+
+## Repository layout
+
+```text
+configs/       AVE protocols, dataset template, and dataset configs
+data/          documented raw/processed/manifests locations (ignored by Git)
+docs/          architecture, adapter onboarding, experiment, audit, reproducibility
+references/    preserved research papers and reference files
+outputs/       ignored experiment artifacts
+scripts/       data, training, and analysis commands
+src/ave_mm/    AVE adapter, integrity audit, split policy, and compatibility models
+src/multimodal/ shared adapters, encoders/fusion, objectives, training, provenance
+tests/         unit/reliability/report tests and offline end-to-end integration
+```

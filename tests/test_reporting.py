@@ -29,13 +29,17 @@ def _make_synthetic_report_inputs(tmp_path, protocol="official"):
     config_path = tmp_path / "config.yaml"
     output_name = "official" if protocol == "official" else "source_video_disjoint"
     config_path.write_text(yaml.safe_dump({"seed": 3, "output_dir": str(tmp_path / "out" / output_name),
-        "dataset": {"split_protocol": protocol, "kwargs": {"manifest_path": str(manifest)}}}))
+        "dataset": {"name": "synthetic", "adapter": "synthetic", "split_protocol": protocol,
+                    "kwargs": {"manifest_path": str(manifest)}}}))
     targets_path = tmp_path / "ucd_targets.json"
     targets_path.write_text(json.dumps({"global": {"target": [.4, .6]}}))
     config = yaml.safe_load(config_path.read_text())
     reference_run = {"split_protocol": protocol, "seed": 3, "run_id": f"reference-{protocol}-3",
         "training_sample_ids_sha256": ids_hash([f"train-{i}" for i in range(7)]),
-        "experiment_config_sha256": config_hash(config)}
+        "experiment_config_sha256": config_hash(config), "dataset_name": "synthetic",
+        "dataset_adapter": "synthetic", "dataset_manifest_sha256": file_sha256(manifest),
+        "split_assignments_sha256": file_sha256(manifest),
+        "class_to_id": {name: i for i, name in enumerate(names)}}
     ref_dir = tmp_path / "reference" / "seed_3"
     ref_dir.mkdir(parents=True)
     reference_checkpoint = ref_dir / "reference_best.pt"
@@ -73,6 +77,7 @@ def _make_synthetic_report_inputs(tmp_path, protocol="official"):
         test_dir.mkdir()
         metrics = {"seed": 3, "experiment_seed": 3, "split_protocol": protocol,
             "model_condition": model, "checkpoint": str(checkpoint),
+            "dataset_name": "synthetic", "dataset_adapter": "synthetic",
             "checkpoint_sha256": reference_sha if model == "reference" else file_sha256(checkpoint),
             "run_provenance": (reference_run if model == "reference" else
                                {**reference_run, "reference_checkpoint_sha256": reference_sha}),

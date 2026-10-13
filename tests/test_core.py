@@ -292,6 +292,11 @@ class TinyDataset(Dataset):
         self.sample_ids = [f"tiny{offset}_{i}" for i in range(4)]
         self.source_ids = [f"source{offset}_{i}" for i in range(4)]
         self.num_classes = 2
+        self.class_names = ["0", "1"]
+        self.class_to_id = {"0": 0, "1": 1}
+        self.split = "train"
+        self.split_protocol = "synthetic"
+        self.metadata = {"dataset_name": "tiny", "adapter": "tests.TinyDataset"}
 
     def __len__(self):
         return 4
@@ -357,10 +362,11 @@ def test_reference_to_joint_checkpoint_smoke(tmp_path):
     assert joint["epoch"] == 1
     config_path = tmp_path / "smoke.yaml"
     config = {"seed": 2, "device": "cpu", "output_dir": str(tmp_path / "eval"),
-              "dataset": {"split_protocol": "synthetic", "factory": "tests.test_core:make_tiny_training_datasets", "kwargs": {}},
-              "test_dataset": {"split_protocol": "synthetic", "factory": "tests.test_core:make_tiny_test_dataset", "kwargs": {}},
+              "dataset": {"name": "tiny", "adapter": "synthetic", "split_protocol": "synthetic", "factory": "tests.test_core:make_tiny_training_datasets", "kwargs": {}},
+              "test_dataset": {"name": "tiny", "adapter": "synthetic", "split_protocol": "synthetic", "factory": "tests.test_core:make_tiny_test_dataset", "kwargs": {}},
               "model": {"factory": "tests.test_core:make_tiny_model", "kwargs": {}},
-              "training": {"batch_size": 2, "num_workers": 0}, "contribution": {}}
+              "training": {"batch_size": 2, "num_workers": 0, "epochs": 1,
+                           "learning_rate": .001, "weight_decay": 0.}, "contribution": {}}
     config_path.write_text(yaml.safe_dump(config))
     previous_argv = sys.argv
     try:

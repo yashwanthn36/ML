@@ -74,6 +74,10 @@ def validate_split_datasets(train: Any, validation: Any, test: Any | None = None
     ids = {key: set(value.sample_ids) for key, value in datasets.items()}
     sources = {key: set(value.source_ids) for key, value in datasets.items()
                if getattr(value, "source_ids", None) is not None}
+    if require_source_disjoint:
+        missing_source = [key for key, value in datasets.items() if getattr(value, "source_ids", None) is None]
+        if missing_source:
+            raise ValueError(f"Source-disjoint protocol requires source_ids for every partition; missing: {missing_source}")
     for left_i, left in enumerate(datasets):
         for right in list(datasets)[left_i + 1:]:
             overlap = ids[left] & ids[right]
@@ -83,4 +87,12 @@ def validate_split_datasets(train: Any, validation: Any, test: Any | None = None
                 common = sources[left] & sources[right]
                 if common:
                     raise ValueError(f"Source IDs overlap between {left} and {right}: {sorted(common)[:5]}")
-    return {"partitions": contracts, "source_disjoint_required": require_source_disjoint}
+    support = {key: {str(class_id): int(sum(int(label) == class_id for label in value.labels))
+                     for class_id in range(int(value.num_classes))}
+               for key, value in datasets.items()}
+    missing_classes = {key: [int(class_id) for class_id, count in partition.items() if count == 0]
+                       for key, partition in support.items()}
+    if missing_classes["train"]:
+        raise ValueError(f"Training partition has no samples for configured class IDs: {missing_classes['train']}")
+    return {"partitions": contracts, "source_disjoint_required": require_source_disjoint,
+            "class_support_by_partition": support, "missing_class_ids_by_partition": missing_classes}
