@@ -1,0 +1,10 @@
+{
+  "video_count": 4097,
+  "audio_count": 4097,
+  "sample_rate_hz": 16000,
+  "channels": 1,
+  "encoding": "PCM signed 16-bit little-endian WAV",
+  "skipped_existing_count": 4097,
+  "failure_count": 0,
+  "failures": []
+}
