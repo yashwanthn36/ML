@@ -1,12 +1,16 @@
 ﻿"""Create a segment-level AVE manifest from the archive metadata."""
 from __future__ import annotations
 import csv
+import argparse
 import json
 import zipfile
 from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(ROOT / "src"))
+from ave_mm.splits import source_video_disjoint_split
 DATA_DIR = ROOT / "data" / "raw" / "AVE" / "ave"
 ARCHIVE = ROOT / "data" / "raw" / "AVE" / "ave.zip"
 SPLIT_FILES = {"train": "trainSet.txt", "val": "valSet.txt", "test": "testSet.txt"}
@@ -26,6 +30,11 @@ def parse(content: str, name: str) -> list[dict[str, str]]:
     return records
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--include-source-video-disjoint", action="store_true",
+                        help="Also write the source-disjoint manifest and summary")
+    parser.add_argument("--seed", type=int, default=17)
+    args = parser.parse_args()
     with zipfile.ZipFile(ARCHIVE) as z:
         members = {Path(x.filename).name: x for x in z.infolist()}
         needed = {"Annotations.txt", "ReadMe.txt", *SPLIT_FILES.values()}
@@ -43,7 +52,8 @@ def main() -> None:
         for i, r in enumerate(rows, 1):
             manifest.append({"sample_id": f"{split}_{i:04d}", "video_id": r["video_id"],
                 "label": r["category"], "label_id": label_ids[r["category"]], "quality": r["quality"],
-                "split": split, "time_start": float(r["start_time"]), "time_end": float(r["end_time"]),
+                "split": split, "split_protocol": "official",
+                "time_start": float(r["start_time"]), "time_end": float(r["end_time"]),
                 "video_path": f"data/raw/AVE/ave/video/{r['video_id']}.mp4",
                 "audio_path": f"data/raw/AVE/ave/audio/{r['video_id']}.wav",
                 "video_present_in_archive": r["video_id"] in videos})
@@ -75,6 +85,20 @@ def main() -> None:
     (DATA_DIR / "ave_dataset_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
     print(f"Wrote {DATA_DIR / 'ave_manifest.csv'} ({len(manifest)} segments)")
     print(f"Wrote {DATA_DIR / 'ave_dataset_summary.json'} ({len(classes)} classes, {len(videos)} videos)")
+    if args.include_source_video_disjoint:
+        disjoint_rows, disjoint_summary = source_video_disjoint_split(manifest, seed=args.seed)
+        for row in disjoint_rows:
+            row["split_protocol"] = "source_video_disjoint"
+        disjoint_manifest_path = DATA_DIR / "ave_manifest_source_video_disjoint.csv"
+        with disjoint_manifest_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(disjoint_rows[0]))
+            writer.writeheader()
+            writer.writerows(disjoint_rows)
+        disjoint_summary_path = DATA_DIR / "ave_source_video_disjoint_summary.json"
+        disjoint_summary_path.write_text(json.dumps(disjoint_summary, indent=2, ensure_ascii=False)+"\n",
+                                         encoding="utf-8")
+        print(f"Wrote {disjoint_manifest_path}")
+        print(f"Wrote {disjoint_summary_path}")
 
 if __name__ == "__main__":
     main()

@@ -38,7 +38,10 @@ def main() -> None:
         "factory": "ave_mm.dataset:build_test_dataset", "kwargs": config["dataset"].get("kwargs", {})
     })
     dataset_factory = load_factory(dataset_cfg["factory"])
-    test_set = dataset_factory(**dataset_cfg.get("kwargs", {}))
+    dataset_kwargs = dict(dataset_cfg.get("kwargs", {}))
+    if "split_protocol" in dataset_cfg:
+        dataset_kwargs["split_protocol"] = dataset_cfg["split_protocol"]
+    test_set = dataset_factory(**dataset_kwargs)
     if isinstance(test_set, tuple):
         raise ValueError("Test factory must return a single test dataset, not train/validation datasets")
     model_cfg = config["model"]
@@ -102,8 +105,8 @@ def main() -> None:
     source_1 = torch.cat(full_modality_1, dim=0)
     source_2 = torch.cat(full_modality_2, dim=0)
     fused_all = torch.cat(fused_features, dim=0)
-    fcd = InfoNCEFCD(float(config.get("contribution", {}).get("epsilon", 1e-8)))(
-        fused_all, source_1, source_2).mean(dim=0)
+    fcd = InfoNCEFCD(float(config.get("contribution", {}).get("epsilon", 1e-8)), queue_size=0)(
+        fused_all, source_1, source_2)
     metrics["fcd_test"] = fcd.tolist()
     if args.targets:
         targets_path = args.targets if args.targets.is_absolute() else PROJECT_ROOT / args.targets
@@ -112,6 +115,9 @@ def main() -> None:
         metrics["ucd_minus_fcd_kl_test"] = float(target_to_current_kl(ucd, fcd).cpu())
     metrics["checkpoint"] = str(checkpoint_path)
     metrics["test_size"] = len(test_set)
+    metrics["split_protocol"] = getattr(test_set, "split_protocol",
+                                         dataset_cfg.get("split_protocol", "unknown"))
+    metrics["checkpoint_split_protocol"] = checkpoint.get("split_protocol", "unknown")
     (output_dir / "test_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     print(f"saved final test results under {output_dir}")
 

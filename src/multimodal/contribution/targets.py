@@ -10,7 +10,14 @@ import numpy as np
 
 def risk_based_distribution(deltas: np.ndarray, *, epsilon: float = 1e-8) -> np.ndarray:
     """Normalize positive mean removal-risk increases using the PDF's Eq. (6.1-6.2)."""
-    increases = np.maximum(np.asarray(deltas, dtype=np.float64).mean(axis=0), 0.0)
+    values = np.asarray(deltas, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != 2 or values.shape[0] == 0:
+        raise ValueError("UCD deltas must be a nonempty [samples, 2] array")
+    if not np.isfinite(values).all():
+        raise ValueError("UCD deltas contain non-finite values")
+    if epsilon <= 0:
+        raise ValueError("epsilon must be positive")
+    increases = np.maximum(values.mean(axis=0), 0.0)
     weights = increases + epsilon
     return weights / weights.sum()
 
@@ -30,27 +37,32 @@ def build_ucd_targets(signatures_csv: str | Path, output_json: str | Path, *,
     labels = np.asarray([int(row["label"]) for row in rows])
     deltas = np.asarray([[float(row["delta_1"]), float(row["delta_2"])] for row in rows])
     sample_ids = [row["sample_id"] for row in rows]
+    source_ids = [row.get("source_id") or row["sample_id"] for row in rows]
     rng = np.random.default_rng(seed)
 
-    def estimate(scope_values: np.ndarray) -> dict[str, Any]:
+    def estimate(scope_values: np.ndarray, scope_sources: list[str]) -> dict[str, Any]:
         target = risk_based_distribution(scope_values, epsilon=epsilon)
         if bootstrap_replicates <= 0:
             uncertainty = None
         else:
             samples = np.empty((bootstrap_replicates, 2), dtype=np.float64)
             for b in range(bootstrap_replicates):
-                sample_indices = rng.integers(0, len(scope_values), size=len(scope_values))
-                samples[b] = risk_based_distribution(scope_values[sample_indices], epsilon=epsilon)
+                unique_sources = np.asarray(sorted(set(scope_sources)))
+                sampled_sources = rng.choice(unique_sources, size=len(unique_sources), replace=True)
+                selected = np.concatenate([np.flatnonzero(np.asarray(scope_sources) == source)
+                                           for source in sampled_sources])
+                samples[b] = risk_based_distribution(scope_values[selected], epsilon=epsilon)
             uncertainty = {"bootstrap_std": samples.std(axis=0).tolist(),
-                           "ci_95_low": np.quantile(samples, 0.025, axis=0).tolist(),
-                           "ci_95_high": np.quantile(samples, 0.975, axis=0).tolist(),
-                           "replicates": bootstrap_replicates}
+                           "bootstrap_quantile_2_5": np.quantile(samples, 0.025, axis=0).tolist(),
+                           "bootstrap_quantile_97_5": np.quantile(samples, 0.975, axis=0).tolist(),
+                           "replicates": bootstrap_replicates,
+                           "resampling_unit": "source_id_cluster"}
         stable = (uncertainty is None or max(uncertainty["bootstrap_std"]) <= max_bootstrap_std
                   if max_bootstrap_std is not None else True)
         return {"target": target.tolist(), "support": int(len(scope_values)),
                 "uncertainty": uncertainty, "stable": bool(stable)}
 
-    targets: dict[str, Any] = {"global": estimate(deltas),
+    targets: dict[str, Any] = {"global": estimate(deltas, source_ids),
        "classes": {}, "groups": {}, "sample_group": group_ids or {},
        "epsilon": epsilon, "min_support": min_support,
        "max_bootstrap_std": max_bootstrap_std, "fallbacks": []}
@@ -58,7 +70,7 @@ def build_ucd_targets(signatures_csv: str | Path, output_json: str | Path, *,
     for class_id in ids:
         mask = labels == class_id
         key = str(class_id)
-        class_estimate = estimate(deltas[mask]) if int(mask.sum()) else None
+        class_estimate = estimate(deltas[mask], [source_ids[i] for i in np.flatnonzero(mask)]) if int(mask.sum()) else None
         if class_estimate and int(mask.sum()) >= min_support and class_estimate["stable"]:
             targets["classes"][key] = {**class_estimate, "fallback": None}
         else:
@@ -74,7 +86,7 @@ def build_ucd_targets(signatures_csv: str | Path, output_json: str | Path, *,
         for group_id in sorted(set(memberships[mask].tolist()) - {-1}):
             group_mask = mask & (memberships == group_id)
             group_key = f"{class_id}:{group_id}"
-            group_estimate = estimate(deltas[group_mask]) if int(group_mask.sum()) else None
+            group_estimate = estimate(deltas[group_mask], [source_ids[i] for i in np.flatnonzero(group_mask)]) if int(group_mask.sum()) else None
             if group_estimate and int(group_mask.sum()) >= min_support and group_estimate["stable"]:
                 targets["groups"][group_key] = {**group_estimate, "fallback": None}
             else:

@@ -22,10 +22,15 @@ def cluster_profiles(signatures_csv: str | Path, output_json: str | Path, *,
     if not rows:
         raise ValueError("No training signatures were supplied")
     values = np.asarray([[float(r["delta_1"]), float(r["delta_2"])] for r in rows], dtype=np.float64)
+    if not np.isfinite(values).all():
+        raise ValueError("Training signatures contain non-finite contribution values")
     mean, std = values.mean(axis=0), values.std(axis=0)
     scaled = (values - mean) / np.maximum(std, dispersion_epsilon)
     labels = np.asarray([int(r["label"]) for r in rows])
     ids = [r["sample_id"] for r in rows]
+    if len(set(ids)) != len(ids):
+        raise ValueError("Fitted signature sample_id values must be unique")
+    fit_source_ids = [r.get("source_id", "") for r in rows]
     groups: dict[str, int] = {}
     stats: dict[str, Any] = {}
     diagnostics: dict[str, Any] = {}
@@ -47,6 +52,8 @@ def cluster_profiles(signatures_csv: str | Path, output_json: str | Path, *,
         else:
             upper = min(max_groups, count // required)
             for candidate_count in range(2, upper + 1):
+                if candidate_count >= count:
+                    continue  # silhouette is undefined when every sample is its own cluster
                 candidate = AgglomerativeClustering(n_clusters=candidate_count, linkage="ward").fit_predict(class_values)
                 support = np.bincount(candidate, minlength=candidate_count)
                 if int(support.min()) < required:
@@ -75,19 +82,39 @@ def cluster_profiles(signatures_csv: str | Path, output_json: str | Path, *,
     if assignment_signatures_csv is not None:
         with Path(assignment_signatures_csv).open("r", newline="", encoding="utf-8") as handle:
             assignment_rows = list(csv.DictReader(handle))
+        assignment_ids = [row["sample_id"] for row in assignment_rows]
+        if len(set(assignment_ids)) != len(assignment_ids):
+            raise ValueError("Assignment signature sample_id values must be unique")
+        assignment_source_ids = [row.get("source_id", "") for row in assignment_rows]
         for row in assignment_rows:
             sample_id = row["sample_id"]
             if sample_id in groups:
+                fit_label = labels[ids.index(sample_id)]
+                if int(row["label"]) != int(fit_label):
+                    raise ValueError(f"Label mismatch for fitted sample {sample_id!r}")
                 continue
             class_id = int(row["label"])
             if class_id not in class_centroids:
                 raise ValueError(f"No fitted contribution profile for class {class_id}")
             signature = np.asarray([float(row["delta_1"]), float(row["delta_2"])])
+            if not np.isfinite(signature).all():
+                raise ValueError(f"Non-finite contribution signature for sample {sample_id!r}")
             standardized = (signature - mean) / np.maximum(std, dispersion_epsilon)
             nearest = min(class_centroids[class_id],
                           key=lambda group_id: float(np.sum((standardized - class_centroids[class_id][group_id]) ** 2)))
             groups[sample_id] = int(nearest)
+    else:
+        assignment_ids = ids
+        assignment_source_ids = fit_source_ids
+    if assignment_signatures_csv is not None and set(assignment_ids) - set(groups):
+        missing = sorted(set(assignment_ids) - set(groups))
+        raise ValueError(f"No contribution group assignment for {len(missing)} samples: {missing[:5]}")
     result = {"assignments": groups, "group_statistics": stats, "diagnostics": diagnostics,
+              "fit_sample_ids": ids, "fit_source_ids": fit_source_ids,
+              "assignment_sample_ids": assignment_ids,
+              "assignment_source_ids": assignment_source_ids,
+              "assignment_signature_status": ("reference_model_in_sample_for_fit_rows"
+                                                if assignment_signatures_csv else "fit_rows_only"),
               "scaler": {"mean": mean.tolist(), "std": std.tolist()},
               "linkage": "ward", "distance": "euclidean", "candidate_groups": list(range(1, max_groups + 1)),
               "min_support_floor": min_support_floor}

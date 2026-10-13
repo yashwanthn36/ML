@@ -32,7 +32,10 @@ def main() -> None:
     config_path = args.config if args.config.is_absolute() else PROJECT_ROOT / args.config
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     dataset_cfg, model_cfg, training_cfg = config["dataset"], config["model"], config["training"]
-    train_set, _ = load_factory(dataset_cfg["factory"])(**dataset_cfg.get("kwargs", {}))
+    dataset_kwargs = dict(dataset_cfg.get("kwargs", {}))
+    if "split_protocol" in dataset_cfg:
+        dataset_kwargs["split_protocol"] = dataset_cfg["split_protocol"]
+    train_set, _ = load_factory(dataset_cfg["factory"])(**dataset_kwargs)
     model = load_factory(model_cfg["factory"])(num_classes=train_set.num_classes,
                                                 **model_cfg.get("kwargs", {}))
     checkpoint_path = args.checkpoint if args.checkpoint.is_absolute() else PROJECT_ROOT / args.checkpoint
@@ -46,13 +49,21 @@ def main() -> None:
     if not estimation_ids_path.is_absolute():
         estimation_ids_path = PROJECT_ROOT / estimation_ids_path
     if estimation_ids_path.exists():
-        estimation_ids = set(json.loads(estimation_ids_path.read_text(encoding="utf-8"))["sample_ids"])
+        estimation_metadata = json.loads(estimation_ids_path.read_text(encoding="utf-8"))
+        estimation_ids = set(estimation_metadata["sample_ids"])
+        training_ids = set(train_set.sample_ids)
+        unknown_ids = sorted(estimation_ids - training_ids)
+        if unknown_ids:
+            raise ValueError(f"Estimation IDs are not in the current training partition: {unknown_ids[:5]}")
+        if len(train_set.sample_ids) != len(training_ids):
+            raise ValueError("Training dataset sample IDs must be unique for leakage-safe contribution fitting")
         estimation_indices = [i for i, sample_id in enumerate(train_set.sample_ids) if sample_id in estimation_ids]
         if not estimation_indices:
             raise ValueError(f"No training samples match the estimation ID file: {estimation_ids_path}")
         estimation_set = Subset(train_set, estimation_indices)
     else:
-        estimation_set = train_set
+        raise FileNotFoundError("Reference checkpoint has no training_estimation_ids.json; refusing to "
+                                "silently estimate contributions on all reference-training examples")
     loader_args = {"batch_size": int(training_cfg["batch_size"]), "shuffle": False,
                    "num_workers": int(training_cfg["num_workers"]), "pin_memory": torch.cuda.is_available()}
     estimation_loader = DataLoader(estimation_set, **loader_args)
@@ -87,6 +98,20 @@ def main() -> None:
         seed=int(config["seed"]),
         max_bootstrap_std=contribution_cfg.get("max_bootstrap_std", 0.15),
     )
+    protocol = {
+        "protocol": estimation_metadata.get("protocol", "unspecified"),
+        "split_protocol": getattr(train_set, "split_protocol", dataset_cfg.get("split_protocol", "unknown")),
+        "estimation_sample_ids": sorted(estimation_ids),
+        "reference_fit_sample_ids": estimation_metadata.get("fit_sample_ids", []),
+        "reference_fit_source_ids": estimation_metadata.get("fit_source_ids", []),
+        "estimation_source_ids": estimation_metadata.get("estimation_source_ids", []),
+        "assignment_sample_ids": list(train_set.sample_ids),
+        "assignment_source_ids": list(getattr(train_set, "source_ids", [])),
+        "assignment_signatures_include_reference_fit_examples": all_signatures_path is not None,
+        "validation_or_test_used": False,
+        "limitations": estimation_metadata.get("limitations", []),
+    }
+    (out / "contribution_protocol.json").write_text(json.dumps(protocol, indent=2), encoding="utf-8")
     (out / "analysis_summary.json").write_text(json.dumps({
         "checkpoint": str(checkpoint_path), "signatures": str(signatures_path),
         "reference_fcd": str(out / "reference_fcd.json"),

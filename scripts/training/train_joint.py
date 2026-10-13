@@ -35,7 +35,10 @@ def main() -> None:
     set_seed(int(config["seed"]))
     dataset_cfg, model_cfg, training_cfg = config["dataset"], config["model"], config["training"]
     dataset_factory = load_factory(dataset_cfg["factory"])
-    train_set, validation_set = dataset_factory(**dataset_cfg.get("kwargs", {}))
+    dataset_kwargs = dict(dataset_cfg.get("kwargs", {}))
+    if "split_protocol" in dataset_cfg:
+        dataset_kwargs["split_protocol"] = dataset_cfg["split_protocol"]
+    train_set, validation_set = dataset_factory(**dataset_kwargs)
     loader_args = {"batch_size": int(training_cfg["batch_size"]),
                    "num_workers": int(training_cfg["num_workers"]),
                    "pin_memory": torch.cuda.is_available()}

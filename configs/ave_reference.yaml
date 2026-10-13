@@ -3,6 +3,7 @@ output_dir: outputs/ave/reference
 
 dataset:
   factory: ave_mm.dataset:build_datasets
+  split_protocol: official
   kwargs:
     manifest_path: data/raw/AVE/ave/ave_manifest.csv
     root: .
@@ -10,9 +11,12 @@ dataset:
     image_size: 224
     sample_rate: 16000
     audio_samples: 160000
+    temporal_window_policy: full_clip
+    min_audio_coverage: 0.5
 
 test_dataset:
   factory: ave_mm.dataset:build_test_dataset
+  split_protocol: official
   kwargs:
     manifest_path: data/raw/AVE/ave/ave_manifest.csv
     root: .
@@ -20,6 +24,8 @@ test_dataset:
     image_size: 224
     sample_rate: 16000
     audio_samples: 160000
+    temporal_window_policy: full_clip
+    min_audio_coverage: 0.5
 
 model:
   factory: ave_mm.models:build_model
@@ -45,6 +51,8 @@ contribution:
   target_estimator: risk_based
   target_granularity: global
   epsilon: 1.0e-8
+  fcd_kwargs:
+    queue_size: 1024
   bootstrap_replicates: 200
   max_bootstrap_std: 0.15
   target_min_support: 20

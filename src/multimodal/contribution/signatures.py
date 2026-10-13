@@ -43,10 +43,12 @@ def estimate_signatures(model: nn.Module, loader: DataLoader, output_csv: str | 
                         "label_name": batch.get("label_name", [""] * labels.size(0))[i],
                         "split": batch.get("split", [""] * labels.size(0))[i],
                         "full_loss": float(full[i]),
-                        "loss_without_1": float(only_1[i]),
-                        "loss_without_2": float(only_2[i]),
-                        "delta_1": float(only_1[i] - full[i]),
-                        "delta_2": float(only_2[i] - full[i]),
+                        # Mask [0, 1] keeps only modality 2, hence modality 1 is removed.
+                        "loss_without_1": float(only_2[i]),
+                        # Mask [1, 0] keeps only modality 1, hence modality 2 is removed.
+                        "loss_without_2": float(only_1[i]),
+                        "delta_1": float(only_2[i] - full[i]),
+                        "delta_2": float(only_1[i] - full[i]),
                     })
     finally:
         model.train(was_training)
@@ -75,7 +77,11 @@ def estimate_reference_fcd(model: nn.Module, loader: DataLoader, estimator: nn.M
         raise ValueError("Cannot estimate reference FCD from an empty loader")
     if sum(row.shape[0] for row in fused_rows) < 2:
         raise ValueError("Reference FCD needs at least two paired examples")
-    fcd = estimator(torch.cat(fused_rows), torch.cat(modality_1_rows), torch.cat(modality_2_rows))
-    return {"mean": fcd.mean(dim=0).cpu().tolist(),
-            "per_sample": fcd.cpu().tolist(), "sample_count": int(fcd.shape[0]),
+    information = estimator.per_sample_information(
+        torch.cat(fused_rows), torch.cat(modality_1_rows), torch.cat(modality_2_rows)
+    )
+    distribution = estimator.distribution(information)
+    return {"distribution": distribution.cpu().tolist(),
+            "mean_information_lower_bound": information.mean(dim=0).cpu().tolist(),
+            "sample_count": int(information.shape[0]), "negative_pool": "entire_estimation_subset",
             "estimator": type(estimator).__name__}

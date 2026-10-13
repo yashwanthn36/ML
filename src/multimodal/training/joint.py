@@ -12,10 +12,12 @@ from torch.utils.data import DataLoader
 from multimodal.losses.alignment import target_to_current_kl
 from multimodal.losses.balanced import class_balanced_ce, group_balanced_ce
 from multimodal.optim import min_norm_combine, gradient_diagnostics
+from multimodal.training.metadata import experiment_metadata
 
 
-def _scope_alignment(current: torch.Tensor, labels: torch.Tensor, group_ids: torch.Tensor | None,
-                     targets: dict[str, Any], granularity: str, epsilon: float) -> torch.Tensor:
+def _scope_alignment(information: torch.Tensor, labels: torch.Tensor,
+                     group_ids: torch.Tensor | None, targets: dict[str, Any],
+                     granularity: str, epsilon: float, fcd_estimator: Any) -> torch.Tensor:
     if granularity == "global":
         scopes = [(torch.ones_like(labels, dtype=torch.bool), targets["global"]["target"])]
     elif granularity == "class":
@@ -37,9 +39,9 @@ def _scope_alignment(current: torch.Tensor, labels: torch.Tensor, group_ids: tor
     losses = []
     for mask, target in scopes:
         if mask.any():
-            current_mean = current[mask].mean(dim=0)
-            target_tensor = torch.as_tensor(target, dtype=current.dtype, device=current.device)
-            losses.append(target_to_current_kl(target_tensor, current_mean, epsilon))
+            current_distribution = fcd_estimator.distribution(information[mask])
+            target_tensor = torch.as_tensor(target, dtype=information.dtype, device=information.device)
+            losses.append(target_to_current_kl(target_tensor, current_distribution, epsilon))
     return torch.stack(losses).mean()
 
 
@@ -66,6 +68,8 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
     model.freeze_encoders = True
     model.encoder_1.eval()
     model.encoder_2.eval()
+    if hasattr(fcd_estimator, "reset_queue"):
+        fcd_estimator.reset_queue()
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not parameters:
         raise ValueError("No trainable fusion/projection parameters remain for stage-two optimization")
@@ -74,9 +78,16 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
     mode = str(training.get("optimization_mode", "fixed_weight"))
     ci_mode = str(training.get("ci_objective", "class_balanced"))
     granularity = str(config.get("contribution", {}).get("target_granularity", "global"))
+    protocol_dataset = train_loader.dataset
+    while hasattr(protocol_dataset, "dataset"):
+        protocol_dataset = protocol_dataset.dataset
+    split_protocol = getattr(protocol_dataset, "split_protocol",
+                             config.get("dataset", {}).get("split_protocol", "unspecified"))
     epsilon = float(config.get("contribution", {}).get("epsilon", 1e-8))
     lambda_mi = float(training.get("lambda_mi", 0.1))
     run_dir.mkdir(parents=True, exist_ok=True)
+    run_metadata = experiment_metadata(config)
+    (run_dir / "experiment_metadata.json").write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
     checkpoint_path = run_dir / "joint_best.pt"
     best_f1, stale = -1.0, 0
     group_assignments = group_assignments or {}
@@ -112,6 +123,11 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
                 if ci_mode == "group_balanced" or granularity == "group":
                     if not ids or not group_assignments:
                         raise ValueError("Group objectives require saved training group assignments")
+                    missing_ids = [str(sample_id) for sample_id in ids
+                                   if str(sample_id) not in group_assignments]
+                    if missing_ids:
+                        raise ValueError(f"Missing group assignments for {len(missing_ids)} batch samples; "
+                                         f"examples: {missing_ids[:5]}")
                     group_ids = torch.tensor([group_assignments[str(sample_id)] for sample_id in ids],
                                              device=device, dtype=torch.long)
                 if ci_mode == "group_balanced":
@@ -121,10 +137,16 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
                     loss_ci = class_balanced_ce(logits, labels, class_counts or None)
                 else:
                     loss_ci = nn.functional.cross_entropy(logits, labels)
-                factual = fcd_estimator(fused, modality_1, modality_2)
-                if factual.shape != (labels.shape[0], 2):
-                    raise ValueError("FCD estimator must return nonnegative [batch, 2] contributions")
-                loss_mi = _scope_alignment(factual, labels, group_ids, targets, granularity, epsilon)
+                if not hasattr(fcd_estimator, "per_sample_information") or not hasattr(fcd_estimator, "distribution"):
+                    raise TypeError("FCD estimator must provide per_sample_information and distribution methods")
+                information = fcd_estimator.per_sample_information(
+                    fused, modality_1, modality_2, update_queue=True,
+                    sample_ids=[str(sample_id) for sample_id in ids] if ids else None,
+                )
+                if information.shape != (labels.shape[0], 2):
+                    raise ValueError("FCD information estimator must return signed [batch, 2] MI bounds")
+                loss_mi = _scope_alignment(information, labels, group_ids, targets,
+                                           granularity, epsilon, fcd_estimator)
                 optimizer.zero_grad(set_to_none=True)
                 diagnostics = {}
                 if mode == "fixed_weight":
@@ -149,6 +171,7 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
                 sums["steps"] += 1
             metrics = evaluate(model, validation_loader, device)
             record = {"epoch": epoch, "mode": mode, "ci_objective": ci_mode,
+                      "split_protocol": split_protocol,
                       "granularity": granularity, "lambda_mi": lambda_mi,
                       "train_loss_ci": sums["loss_ci"] / max(sums["steps"], 1),
                       "train_loss_mi": sums["loss_mi"] / max(sums["steps"], 1),
@@ -164,7 +187,8 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
                 best_f1, stale = metrics["macro_f1"], 0
                 torch.save({"model_state_dict": model.state_dict(), "config": config,
                             "seed": seed, "epoch": epoch, "validation_metrics": metrics,
-                            "optimization_mode": mode}, checkpoint_path)
+                            "optimization_mode": mode, "split_protocol": split_protocol,
+                            "experiment_metadata": run_metadata}, checkpoint_path)
             else:
                 stale += 1
                 if stale >= int(training["early_stopping_patience"]):

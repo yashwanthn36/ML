@@ -7,12 +7,12 @@ import sys
 from pathlib import Path
 import torch
 import yaml
-from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Subset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from multimodal.training import set_seed, train_reference
+from multimodal.training.splits import grouped_reference_holdout
 
 
 def load_factory(spec: str):
@@ -30,7 +30,10 @@ def main() -> None:
     set_seed(seed)
 
     dataset_cfg = config["dataset"]
-    train_set, validation_set = load_factory(dataset_cfg["factory"])(**dataset_cfg.get("kwargs", {}))
+    dataset_kwargs = dict(dataset_cfg.get("kwargs", {}))
+    if "split_protocol" in dataset_cfg:
+        dataset_kwargs["split_protocol"] = dataset_cfg["split_protocol"]
+    train_set, validation_set = load_factory(dataset_cfg["factory"])(**dataset_kwargs)
     training_cfg = config["training"]
     estimation_fraction = float(training_cfg.get("contribution_estimation_fraction", 0.2))
     if not 0.0 <= estimation_fraction < 1.0:
@@ -38,16 +41,25 @@ def main() -> None:
     if estimation_fraction:
         if not hasattr(train_set, "labels") or not hasattr(train_set, "sample_ids"):
             raise ValueError("Dataset adapter must expose training-only labels and sample_ids for the holdout split")
-        reference_indices, estimation_indices = train_test_split(
-            list(range(len(train_set))), test_size=estimation_fraction, random_state=seed,
-            stratify=train_set.labels,
+        source_ids = getattr(train_set, "source_ids", None)
+        reference_indices, estimation_indices, contribution_metadata = grouped_reference_holdout(
+            train_set.labels, train_set.sample_ids, source_ids=source_ids,
+            estimation_fraction=estimation_fraction, seed=seed,
         )
         reference_train = Subset(train_set, reference_indices)
         estimation_ids = [train_set.sample_ids[i] for i in estimation_indices]
     else:
+        if not training_cfg.get("allow_in_sample_contributions", False):
+            raise ValueError("Set contribution_estimation_fraction > 0 for independent signatures; "
+                             "in-sample estimation requires allow_in_sample_contributions: true")
         reference_train = train_set
-        estimation_ids = []
-        estimation_indices = []
+        estimation_ids = list(train_set.sample_ids)
+        estimation_indices = list(range(len(train_set)))
+        contribution_metadata = {"protocol": "explicit_in_sample_fallback", "fit_sample_ids": list(train_set.sample_ids),
+                                 "estimation_sample_ids": list(train_set.sample_ids),
+                                 "assignment_sample_ids": list(train_set.sample_ids),
+                                 "limitations": ["Signatures are in-sample and may be optimistic; do not treat "
+                                                 "them as independent estimates."]}
     loader_options = {"batch_size": int(training_cfg["batch_size"]),
                       "num_workers": int(training_cfg["num_workers"]),
                       "pin_memory": torch.cuda.is_available()}
@@ -61,11 +73,14 @@ def main() -> None:
     output = PROJECT_ROOT / config["output_dir"] / f"seed_{seed}"
     output.mkdir(parents=True, exist_ok=True)
     (output / "training_estimation_ids.json").write_text(
-        json.dumps({"indices": estimation_indices, "sample_ids": estimation_ids}, indent=2),
+        json.dumps({**contribution_metadata, "indices": estimation_indices, "sample_ids": estimation_ids,
+                    "split_protocol": getattr(train_set, "split_protocol", dataset_cfg.get("split_protocol", "unknown"))},
+                   indent=2),
         encoding="utf-8",
     )
     checkpoint = train_reference(model, train_loader, validation_loader,
-                                 training=training_cfg, run_dir=output, seed=seed, config=config)
+                                 training=training_cfg, run_dir=output, seed=seed, config=config,
+                                 data_metadata=contribution_metadata)
     print(f"selected checkpoint: {checkpoint}")
 
 
