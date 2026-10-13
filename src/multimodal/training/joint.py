@@ -13,6 +13,8 @@ from multimodal.losses.alignment import target_to_current_kl
 from multimodal.losses.balanced import class_balanced_ce, group_balanced_ce
 from multimodal.optim import min_norm_combine, gradient_diagnostics
 from multimodal.training.metadata import experiment_metadata
+from multimodal.training.device import assert_module_device, select_device, on_device, log_device
+from multimodal.training.provenance import effective_split_protocol
 
 
 def _scope_alignment(information: torch.Tensor, labels: torch.Tensor,
@@ -50,12 +52,18 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
                 group_assignments: dict[str, int] | None,
                 fcd_estimator: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
                 run_dir: Path, seed: int, config: dict[str, Any],
-                reference_checkpoint: dict[str, Any] | None = None) -> Path:
+                reference_checkpoint: dict[str, Any] | None = None,
+                reference_checkpoint_sha256: str | None = None,
+                device: torch.device | None = None) -> Path:
     """Optimize selected CI/MI objectives; the FCD implementation is injected explicitly."""
     from multimodal.training.reference import evaluate
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        device = select_device(str(config.get("device", "auto")))
+    else:
+        log_device(device)
     model = model.to(device)
+    assert_module_device(model, device)
     if reference_checkpoint is None:
         raise ValueError("Second-stage optimization must initialize from the reference checkpoint")
     model.load_state_dict(reference_checkpoint["model_state_dict"])
@@ -78,16 +86,16 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
     mode = str(training.get("optimization_mode", "fixed_weight"))
     ci_mode = str(training.get("ci_objective", "class_balanced"))
     granularity = str(config.get("contribution", {}).get("target_granularity", "global"))
-    protocol_dataset = train_loader.dataset
-    while hasattr(protocol_dataset, "dataset"):
-        protocol_dataset = protocol_dataset.dataset
-    split_protocol = getattr(protocol_dataset, "split_protocol",
-                             config.get("dataset", {}).get("split_protocol", "unspecified"))
+    split_protocol = effective_split_protocol(train_loader.dataset,
+        config.get("dataset", {}).get("split_protocol"))
     epsilon = float(config.get("contribution", {}).get("epsilon", 1e-8))
     lambda_mi = float(training.get("lambda_mi", 0.1))
     run_dir.mkdir(parents=True, exist_ok=True)
     run_metadata = experiment_metadata(config)
+    run_metadata["device"] = str(device)
     (run_dir / "experiment_metadata.json").write_text(json.dumps(run_metadata, indent=2), encoding="utf-8")
+    run_provenance = {**(reference_checkpoint.get("run_provenance") or {}),
+                      "reference_checkpoint_sha256": reference_checkpoint_sha256}
     checkpoint_path = run_dir / "joint_best.pt"
     best_f1, stale = -1.0, 0
     group_assignments = group_assignments or {}
@@ -116,6 +124,8 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
                 x1 = batch["modality_1"].to(device, non_blocking=True)
                 x2 = batch["modality_2"].to(device, non_blocking=True)
                 labels = batch["label"].to(device, non_blocking=True)
+                if not all(on_device(tensor, device) for tensor in (x1, x2, labels)):
+                    raise RuntimeError(f"Training batch is not on selected device {device}")
                 fused, modality_1, modality_2 = model.fused_features(x1, x2)
                 logits = model.classifier(fused)
                 ids = batch.get("sample_id", [])
@@ -142,6 +152,8 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
                 information = fcd_estimator.per_sample_information(
                     fused, modality_1, modality_2, update_queue=True,
                     sample_ids=[str(sample_id) for sample_id in ids] if ids else None,
+                    source_ids=[str(source_id) for source_id in batch.get("source_id", [])]
+                    if batch.get("source_id") else None,
                 )
                 if information.shape != (labels.shape[0], 2):
                     raise ValueError("FCD information estimator must return signed [batch, 2] MI bounds")
@@ -172,6 +184,7 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
             metrics = evaluate(model, validation_loader, device)
             record = {"epoch": epoch, "mode": mode, "ci_objective": ci_mode,
                       "split_protocol": split_protocol,
+                      "device": str(device), "run_provenance": run_provenance,
                       "granularity": granularity, "lambda_mi": lambda_mi,
                       "train_loss_ci": sums["loss_ci"] / max(sums["steps"], 1),
                       "train_loss_mi": sums["loss_mi"] / max(sums["steps"], 1),
@@ -188,7 +201,8 @@ def train_joint(model: nn.Module, train_loader: DataLoader, validation_loader: D
                 torch.save({"model_state_dict": model.state_dict(), "config": config,
                             "seed": seed, "epoch": epoch, "validation_metrics": metrics,
                             "optimization_mode": mode, "split_protocol": split_protocol,
-                            "experiment_metadata": run_metadata}, checkpoint_path)
+                            "experiment_metadata": run_metadata, "device": str(device),
+                            "run_provenance": run_provenance}, checkpoint_path)
             else:
                 stale += 1
                 if stale >= int(training["early_stopping_patience"]):

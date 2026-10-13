@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib
+import json
 import sys
 from pathlib import Path
 
@@ -14,6 +15,10 @@ from torch.utils.data import DataLoader
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from multimodal.models.encoders import build_encoder
+from multimodal.training.device import assert_module_device, select_device, on_device
+from multimodal.training.metadata import experiment_metadata
+from multimodal.training.provenance import (configured_split_protocol, effective_split_protocol,
+                                            ensure_protocol_output)
 
 
 def load_factory(spec: str):
@@ -32,6 +37,8 @@ def cache_split(dataset, encoder_1, encoder_2, name: str, output_dir: Path,
         for batch_number, batch in enumerate(loader):
             raw_1 = batch["modality_1"].to(device)
             raw_2 = batch["modality_2"].to(device)
+            if not on_device(raw_1, device) or not on_device(raw_2, device):
+                raise RuntimeError(f"Feature cache batch is not on selected device {device}")
             features_1, features_2 = encoder_1(raw_1), encoder_2(raw_2)
             for offset, sample_id in enumerate(batch["sample_id"]):
                 item_number = batch_number * batch_size + offset
@@ -51,13 +58,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"))
     args = parser.parse_args()
     config_path = args.config if args.config.is_absolute() else PROJECT_ROOT / args.config
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    configured_protocol = configured_split_protocol(config)
+    if args.device:
+        config["device"] = args.device
+    device = select_device(str(config.get("device", "auto")))
     output_dir = args.output_dir if args.output_dir.is_absolute() else PROJECT_ROOT / args.output_dir
+    dataset_cfg = config["dataset"]
+    dataset_kwargs = dict(dataset_cfg.get("kwargs", {}))
+    if "split_protocol" in dataset_cfg:
+        dataset_kwargs["split_protocol"] = dataset_cfg["split_protocol"]
+    train_set, validation_set = load_factory(dataset_cfg["factory"])(**dataset_kwargs)
+    split_protocol = effective_split_protocol(train_set, configured_protocol)
+    output_dir = ensure_protocol_output(output_dir, split_protocol=split_protocol, seed=int(config["seed"]))
     (output_dir / "features").mkdir(parents=True, exist_ok=True)
-    train_set, validation_set = load_factory(config["dataset"]["factory"])(
-        **config["dataset"].get("kwargs", {}))
     model_cfg, training_cfg = config["model"]["kwargs"], config["training"]
     encoders = []
     for key in ("encoder_1", "encoder_2"):
@@ -66,8 +83,16 @@ def main() -> None:
                                 kwargs=spec.get("kwargs"), factory=spec.get("factory"))
         encoder.eval().requires_grad_(False)
         encoders.append(encoder)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     encoder_1, encoder_2 = (encoder.to(device) for encoder in encoders)
+    assert_module_device(encoder_1, device)
+    assert_module_device(encoder_2, device)
+    metadata = experiment_metadata(config)
+    metadata["device"] = str(device)
+    (output_dir / "experiment_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    (output_dir / "cache_metadata.json").write_text(json.dumps({
+        "split_protocol": split_protocol, "device": str(device),
+        "encoder_configs": {key: model_cfg[key] for key in ("encoder_1", "encoder_2")}}, indent=2),
+        encoding="utf-8")
     with torch.inference_mode():
         train_index = cache_split(train_set, encoder_1, encoder_2, "train", output_dir,
                                   batch_size=int(training_cfg["batch_size"]),
@@ -77,7 +102,11 @@ def main() -> None:
                                        num_workers=int(training_cfg["num_workers"]), device=device)
         test_cfg = config.get("test_dataset")
         if test_cfg:
-            test_set = load_factory(test_cfg["factory"])(**test_cfg.get("kwargs", {}))
+            test_kwargs = dict(test_cfg.get("kwargs", {}))
+            if "split_protocol" in test_cfg:
+                test_kwargs["split_protocol"] = test_cfg["split_protocol"]
+            test_set = load_factory(test_cfg["factory"])(**test_kwargs)
+            effective_split_protocol(test_set, configured_protocol)
             test_index = cache_split(test_set, encoder_1, encoder_2, "test", output_dir,
                                     batch_size=int(training_cfg["batch_size"]),
                                     num_workers=int(training_cfg["num_workers"]), device=device)

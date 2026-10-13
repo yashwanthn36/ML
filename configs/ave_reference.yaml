@@ -1,6 +1,6 @@
-﻿seed: 17
-output_dir: outputs/ave/reference
-
+seed: 17
+device: auto
+output_dir: outputs/ave/official
 dataset:
   factory: ave_mm.dataset:build_datasets
   split_protocol: official
@@ -13,7 +13,6 @@ dataset:
     audio_samples: 160000
     temporal_window_policy: full_clip
     min_audio_coverage: 0.5
-
 test_dataset:
   factory: ave_mm.dataset:build_test_dataset
   split_protocol: official
@@ -26,7 +25,6 @@ test_dataset:
     audio_samples: 160000
     temporal_window_policy: full_clip
     min_audio_coverage: 0.5
-
 model:
   factory: ave_mm.models:build_model
   kwargs:
@@ -44,21 +42,20 @@ model:
         pretrained: true
         freeze: true
     freeze_encoders: true
-
 contribution:
   estimator: utopia_mutual_information
   fcd_factory: multimodal.contribution.fcd:InfoNCEFCD
   target_estimator: risk_based
   target_granularity: global
-  epsilon: 1.0e-8
+  epsilon: 1.0e-08
   fcd_kwargs:
     queue_size: 1024
+    exclude_same_source_negatives: true
   bootstrap_replicates: 200
   max_bootstrap_std: 0.15
   target_min_support: 20
   min_group_support_floor: 20
   max_groups_per_class: 3
-
 training:
   batch_size: 4
   num_workers: 0
@@ -70,5 +67,9 @@ training:
   contribution_estimation_fraction: 0.2
   optimization_mode: fixed_weight
   ci_objective: class_balanced
-  lambda_mi_grid: [0.01, 0.1, 1.0, 10.0]
+  lambda_mi_grid:
+  - 0.01
+  - 0.1
+  - 1.0
+  - 10.0
   grad_clip: 1.0

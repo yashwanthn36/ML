@@ -7,8 +7,9 @@ valid KL target. This positivity transform is an explicit adaptation, not a
 transform specified by Utopia.
 
 Negatives are previous/current TRAIN examples only. A detached FIFO memory bank
-increases the contrast set beyond the small supervised minibatch; validation,
-test, and reference-FCD calls use the supplied set without updating the bank.
+increases the contrast set beyond the small supervised minibatch. Optional
+same-source exclusion avoids treating sibling AVE segments as negatives; datasets
+without source IDs fall back to sample-ID exclusion only.
 """
 from __future__ import annotations
 
@@ -29,7 +30,8 @@ class InfoNCEFCD(nn.Module):
     minibatch candidates; queue entries are detached historical negatives.
     """
 
-    def __init__(self, epsilon: float = 1e-8, queue_size: int = 1024) -> None:
+    def __init__(self, epsilon: float = 1e-8, queue_size: int = 1024,
+                 exclude_same_source_negatives: bool = False) -> None:
         super().__init__()
         if not (epsilon > 0.0):
             raise ValueError("epsilon must be positive")
@@ -37,7 +39,8 @@ class InfoNCEFCD(nn.Module):
             raise ValueError("queue_size must be nonnegative")
         self.epsilon = float(epsilon)
         self.queue_size = int(queue_size)
-        self._queue: deque[tuple[torch.Tensor, str | None]] = deque()
+        self.exclude_same_source_negatives = bool(exclude_same_source_negatives)
+        self._queue: deque[tuple[torch.Tensor, str | None, str | None]] = deque()
         self._queue_count = 0
 
     @property
@@ -74,15 +77,18 @@ class InfoNCEFCD(nn.Module):
     def _normalized(value: torch.Tensor, epsilon: float) -> torch.Tensor:
         return F.normalize(value, p=2, dim=-1, eps=epsilon)
 
-    def _remember(self, fused_values: torch.Tensor, sample_ids: list[str] | None = None) -> None:
+    def _remember(self, fused_values: torch.Tensor, sample_ids: list[str] | None = None,
+                  source_ids: list[str] | None = None) -> None:
         if self.queue_size == 0:
             return
         detached = fused_values.detach()
         identities = sample_ids or [None] * detached.shape[0]
-        if len(identities) != detached.shape[0]:
-            raise ValueError("sample_ids must have one ID per FCD row")
-        for value, identity in zip(detached, identities):
-            self._queue.append((value.unsqueeze(0), None if identity is None else str(identity)))
+        sources = source_ids or [None] * detached.shape[0]
+        if len(identities) != detached.shape[0] or len(sources) != detached.shape[0]:
+            raise ValueError("sample_ids and source_ids must have one ID per FCD row when provided")
+        for value, identity, source in zip(detached, identities, sources):
+            self._queue.append((value.unsqueeze(0), None if identity is None else str(identity),
+                                None if source is None else str(source)))
             self._queue_count += 1
         while self._queue_count > self.queue_size:
             self._queue.popleft()
@@ -91,7 +97,8 @@ class InfoNCEFCD(nn.Module):
     def per_sample_information(self, fused: torch.Tensor, modality_1: torch.Tensor,
                                modality_2: torch.Tensor, *,
                                update_queue: bool = False,
-                               sample_ids: list[str] | None = None) -> torch.Tensor:
+                               sample_ids: list[str] | None = None,
+                               source_ids: list[str] | None = None) -> torch.Tensor:
         """Return signed InfoNCE lower bounds per anchor and modality.
 
         Each current example is the positive pair. Denominator candidates are
@@ -104,19 +111,26 @@ class InfoNCEFCD(nn.Module):
         x2 = self._normalized(modality_2, self.epsilon)
         if sample_ids is not None and len(sample_ids) != z.shape[0]:
             raise ValueError("sample_ids must have one ID per FCD row")
+        if source_ids is not None and len(source_ids) != z.shape[0]:
+            raise ValueError("source_ids must have one ID per FCD row")
         result_rows = []
         for i in range(z.shape[0]):
             identity = None if sample_ids is None else str(sample_ids[i])
+            source = None if source_ids is None else str(source_ids[i])
             batch_keep = [j for j in range(z.shape[0])
                           if j == i or identity is None or sample_ids is None
                           or str(sample_ids[j]) != identity]
+            if self.exclude_same_source_negatives and source is not None and source_ids is not None:
+                batch_keep = [j for j in batch_keep if j == i or str(source_ids[j]) != source]
             historical = [value.to(device=z.device, dtype=z.dtype)
-                          for value, queue_id in self._queue
-                          if value.device == z.device and (identity is None or queue_id != identity)]
+                          for value, queue_id, queue_source in self._queue
+                          if value.device == z.device and (identity is None or queue_id != identity)
+                          and not (self.exclude_same_source_negatives and source is not None
+                                   and queue_source == source)]
             candidates = torch.cat((z[batch_keep], *historical), dim=0) if historical else z[batch_keep]
             if candidates.shape[0] < 2:
-                raise ValueError("InfoNCE needs at least two candidates after excluding matching sample IDs; "
-                                 "provide another sample or training-queue negative")
+                raise ValueError("InfoNCE has fewer than two valid candidates after configured sample/source "
+                                 "exclusions; provide another independent example or queue negative")
             modality_bounds = []
             for current_x in (x1, x2):
                 scores = current_x[i] @ candidates.transpose(0, 1)
@@ -128,7 +142,7 @@ class InfoNCEFCD(nn.Module):
         if not torch.isfinite(result).all():
             raise ValueError("InfoNCE produced non-finite lower-bound estimates")
         if update_queue:
-            self._remember(z, sample_ids)
+            self._remember(z, sample_ids, source_ids)
         return result
 
     def distribution(self, information: torch.Tensor) -> torch.Tensor:

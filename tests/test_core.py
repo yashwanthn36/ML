@@ -82,7 +82,7 @@ def test_fcd_valid_gradients_queue_and_invalid_inputs():
     estimator.per_sample_information(fused.detach(), x1.detach(), x2.detach(), update_queue=True)
     assert estimator.queue_count == 2
     estimator.per_sample_information(fused[:1].detach(), x1[:1].detach(), x2[:1].detach())
-    with pytest.raises(ValueError, match="at least two"):
+    with pytest.raises(ValueError, match="fewer than two"):
         InfoNCEFCD(queue_size=0).per_sample_information(fused[:1], x1[:1], x2[:1])
     with pytest.raises(ValueError, match="shape"):
         estimator.distribution(torch.ones(2, 3))
@@ -90,7 +90,7 @@ def test_fcd_valid_gradients_queue_and_invalid_inputs():
         estimator.distribution(torch.tensor([[float("nan"), 0.]]))
     identity_queue = InfoNCEFCD(queue_size=4)
     identity_queue._remember(torch.tensor([[1., 0.]]), ["same"])
-    with pytest.raises(ValueError, match="excluding matching"):
+    with pytest.raises(ValueError, match="fewer than two"):
         identity_queue.per_sample_information(fused[:1].detach(), x1[:1].detach(), x2[:1].detach(),
                                                sample_ids=["same"])
 
@@ -283,8 +283,10 @@ def test_reference_to_joint_checkpoint_smoke(tmp_path):
                 "modality_dropout": .1, "grad_clip": 1., "early_stopping_patience": 2}
     reference_path = train_reference(model, DataLoader(train, batch_size=2),
                                      DataLoader(validation, batch_size=2), training=training,
-                                     run_dir=tmp_path / "ref", seed=2, config={},
-                                     data_metadata={"split_protocol": "synthetic"})
+                                     run_dir=tmp_path / "ref", seed=2,
+                                     config={"dataset": {"split_protocol": "synthetic"}, "device": "cpu"},
+                                     data_metadata={"split_protocol": "synthetic"},
+                                     device=torch.device("cpu"))
     checkpoint = torch.load(reference_path, map_location="cpu", weights_only=False)
     assert checkpoint["split_protocol"] == "synthetic"
     signature_path = estimate_signatures(model, DataLoader(train, batch_size=2),
@@ -307,20 +309,22 @@ def test_reference_to_joint_checkpoint_smoke(tmp_path):
                              DataLoader(train, batch_size=2), DataLoader(validation, batch_size=2),
                              training=joint_training, targets=targets, group_assignments=None,
                              fcd_estimator=fcd, run_dir=tmp_path / "joint", seed=2, config={
+                                 "dataset": {"split_protocol": "synthetic"}, "device": "cpu",
                                  "contribution": {"target_granularity": "global", "epsilon": 1e-8}},
                              reference_checkpoint=checkpoint)
     joint = torch.load(joint_path, map_location="cpu", weights_only=False)
     assert joint["epoch"] == 1
     config_path = tmp_path / "smoke.yaml"
-    config = {"seed": 2, "output_dir": str(tmp_path / "eval"),
-              "dataset": {"kwargs": {}},
-              "test_dataset": {"factory": "tests.test_core:make_tiny_test_dataset", "kwargs": {}},
+    config = {"seed": 2, "device": "cpu", "output_dir": str(tmp_path / "eval"),
+              "dataset": {"split_protocol": "synthetic", "kwargs": {}},
+              "test_dataset": {"split_protocol": "synthetic", "factory": "tests.test_core:make_tiny_test_dataset", "kwargs": {}},
               "model": {"factory": "tests.test_core:make_tiny_model", "kwargs": {}},
               "training": {"batch_size": 2, "num_workers": 0}, "contribution": {}}
     config_path.write_text(yaml.safe_dump(config))
     previous_argv = sys.argv
     try:
-        sys.argv = ["evaluate_test.py", "--config", str(config_path), "--checkpoint", str(joint_path)]
+        sys.argv = ["evaluate_test.py", "--config", str(config_path), "--checkpoint", str(joint_path),
+                    "--allow-legacy-artifacts"]
         evaluate_test.main()
     finally:
         sys.argv = previous_argv

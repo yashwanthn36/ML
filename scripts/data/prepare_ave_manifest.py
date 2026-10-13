@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 import sys
 sys.path.insert(0, str(ROOT / "src"))
 from ave_mm.splits import source_video_disjoint_split
+from ave_mm.integrity import audit_manifest
 DATA_DIR = ROOT / "data" / "raw" / "AVE" / "ave"
 ARCHIVE = ROOT / "data" / "raw" / "AVE" / "ave.zip"
 SPLIT_FILES = {"train": "trainSet.txt", "val": "valSet.txt", "test": "testSet.txt"}
@@ -83,6 +84,9 @@ def main() -> None:
                   "Official splits have some source-video ID overlap.",
                   "Audio paths are populated after running scripts/data/extract_ave_audio.py."]}
     (DATA_DIR / "ave_dataset_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
+    integrity = audit_manifest(manifest, summary=summary)
+    (DATA_DIR / "ave_manifest_integrity_report.json").write_text(
+        json.dumps(integrity, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"Wrote {DATA_DIR / 'ave_manifest.csv'} ({len(manifest)} segments)")
     print(f"Wrote {DATA_DIR / 'ave_dataset_summary.json'} ({len(classes)} classes, {len(videos)} videos)")
     if args.include_source_video_disjoint:
@@ -97,6 +101,9 @@ def main() -> None:
         disjoint_summary_path = DATA_DIR / "ave_source_video_disjoint_summary.json"
         disjoint_summary_path.write_text(json.dumps(disjoint_summary, indent=2, ensure_ascii=False)+"\n",
                                          encoding="utf-8")
+        disjoint_integrity = audit_manifest(disjoint_rows, summary=disjoint_summary)
+        (DATA_DIR / "ave_manifest_source_video_disjoint_integrity_report.json").write_text(
+            json.dumps(disjoint_integrity, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         print(f"Wrote {disjoint_manifest_path}")
         print(f"Wrote {disjoint_summary_path}")
 

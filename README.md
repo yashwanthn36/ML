@@ -51,7 +51,7 @@ Negative deltas are retained. They are used as two-dimensional within-class prof
 
 The UCD target is risk-based: mean positive signed risk increments are normalized, with an epsilon for finite probabilities. Class and class/group targets fall back to their parent scope when support is low or bootstrap stability exceeds the configured threshold. Uncertainty uses a source-video cluster bootstrap when source IDs exist (sample IDs otherwise). Its output is labelled bootstrap spread/quantiles, not calibrated confidence intervals.
 
-FCD is a separate MI estimate; it is not computed from signed loss signatures. The local Utopia paper defines an InfoNCE lower bound in Eqs. (7)–(9): L2-normalized modality and fused features, a positive paired score, a log candidate-count term, and a log-sum-exp over positive and negative candidates. `InfoNCEFCD.per_sample_information` returns signed lower bounds `[anchors, 2]`. Negatives are other current-batch examples plus a detached FIFO bank of previous training examples; matching sample IDs in the queue are excluded. Consequently batch composition and queue contents affect the estimate; batch size 4 alone is a weak contrastive pool, which is why training uses a configurable queue (1024 by default). The reference estimate uses the entire independent estimation subset as its candidate pool. Validation/test estimates do not update a queue.
+FCD is a separate MI estimate; it is not computed from signed loss signatures. The local Utopia paper defines an InfoNCE lower bound in Eqs. (7)–(9): L2-normalized modality and fused features, a positive paired score, a log candidate-count term, and a log-sum-exp over positive and negative candidates. `InfoNCEFCD.per_sample_information` returns signed lower bounds `[anchors, 2]`. Negatives are other current-batch examples plus a detached FIFO bank of previous training examples; matching sample IDs are excluded, and AVE sets `exclude_same_source_negatives: true` to exclude sibling source-video segments from current and queued negatives. Sample IDs and source IDs are stored in queue entries. Datasets without source IDs fall back to sample-ID exclusion. Insufficient candidate pools raise an actionable error. This configurable negative-sampling policy is an AVE experiment choice, not an exact reproduction of Utopia. Consequently batch composition and queue contents affect the estimate; batch size 4 alone is a weak contrastive pool, which is why training uses a configurable queue (1024 by default). The reference estimate uses the entire independent estimation subset as its candidate pool. Validation/test estimates do not update a queue.
 
 The paper normalizes MI estimates to get FCD but does not specify how to turn a negative finite-sample InfoNCE bound into a probability. This implementation applies Softplus to the mean bound within each optimization scope, adds epsilon, and normalizes the two modality values. Softplus is an explicit adaptation, not an exact reproduction of Utopia. The result is a finite nonnegative distribution summing to one, and its gradients flow through current representations; queued negatives are detached. Scope-level distributions are computed separately for the selected global, class, or class/group scope. UCD-to-FCD KL uses target UCD as its first argument.
 
@@ -63,35 +63,61 @@ By default the reference trainer holds out 20% of the training partition for con
 
 An explicit all-training in-sample fallback is available only if the config sets `contribution_estimation_fraction: 0` and `allow_in_sample_contributions: true`. It is statistically weaker and is recorded as such. Validation/test data are not passed into estimators. The test evaluator runs only after checkpoint selection.
 
-## Run order
+## AVE protocol configurations and run order
 
-From the repository root:
+Use `configs/ave_official.yaml` for the published AVE assignments and `configs/ave_source_video_disjoint.yaml` for the deterministic source-video-disjoint split (seed 17). Each declares the same protocol in `dataset.split_protocol` and `test_dataset.split_protocol`, and uses a separate root: `outputs/ave/official/` or `outputs/ave/source_video_disjoint/`. Seeded artifacts live below `seed_17/`. `configs/ave_reference.yaml` remains a backward-compatible alias of the official setup and uses the official output root.
+
+Run one protocol at a time from the repository root. Do not mix artifact paths between the two command groups. Provenance validation checks protocol, seed, configuration, sample IDs, and checkpoint SHA-256; output directories carry a protocol marker and reject incompatible reuse. Older artifacts without provenance require the explicit `--allow-legacy-artifacts` option on contribution estimation, joint training, or evaluation. Legacy output directories without a marker must be moved or archived before reuse.
+
+Official protocol:
 
 ```powershell
-# Train reference checkpoint; validation chooses the checkpoint.
-.\.venv\Scripts\python.exe scripts/training/train_reference.py --config configs/ave_reference.yaml
-
-# Estimate independent training contributions, profiles, and UCD targets.
-.\.venv\Scripts\python.exe scripts/training/estimate_contributions.py --config configs/ave_reference.yaml --checkpoint outputs/ave/reference/seed_17/reference_best.pt
-
-# Train the second stage. Fixed-weight runs save one checkpoint per lambda and select by validation macro-F1.
-.\.venv\Scripts\python.exe scripts/training/train_joint.py --config configs/ave_reference.yaml --reference-checkpoint outputs/ave/reference/seed_17/reference_best.pt --targets outputs/ave/reference/seed_17/contributions/ucd_targets.json --groups outputs/ave/reference/seed_17/contributions/profile_groups.json
-
-# Evaluate the selected checkpoint once on test.
-.\.venv\Scripts\python.exe scripts/training/evaluate_test.py --config configs/ave_reference.yaml --checkpoint <selected-checkpoint-path> --targets outputs/ave/reference/seed_17/contributions/ucd_targets.json
+$cfg = "configs/ave_official.yaml"
+$root = "outputs/ave/official/seed_17"
+.\.venv\Scripts\python.exe scripts/training/train_reference.py --config $cfg
+.\.venv\Scripts\python.exe scripts/training/estimate_contributions.py --config $cfg --checkpoint "$root/reference_best.pt"
+.\.venv\Scripts\python.exe scripts/training/train_joint.py --config $cfg --reference-checkpoint "$root/reference_best.pt" --targets "$root/contributions/ucd_targets.json" --groups "$root/contributions/profile_groups.json"
+.\.venv\Scripts\python.exe scripts/training/evaluate_test.py --config $cfg --checkpoint "$root/joint/lambda_0.1/joint_best.pt" --targets "$root/contributions/ucd_targets.json"
 ```
 
-Outputs include per-epoch JSONL logs, the selected checkpoint, `experiment_metadata.json` (encoder/checkpoint aliases, preprocessing config, frozen status, cache configuration and package versions), signature CSVs, `reference_fcd.json`, `profile_groups.json`, `ucd_targets.json`, contribution provenance, validation lambda selection, test predictions, and test metrics. Protocol names are included in data metadata, logs/checkpoints, and evaluation output. Default weight aliases are recorded, but checkpoint files are not hashed. Do not choose settings based on test metrics.
+Source-video-disjoint protocol:
+
+```powershell
+$cfg = "configs/ave_source_video_disjoint.yaml"
+$root = "outputs/ave/source_video_disjoint/seed_17"
+.\.venv\Scripts\python.exe scripts/training/train_reference.py --config $cfg
+.\.venv\Scripts\python.exe scripts/training/estimate_contributions.py --config $cfg --checkpoint "$root/reference_best.pt"
+.\.venv\Scripts\python.exe scripts/training/train_joint.py --config $cfg --reference-checkpoint "$root/reference_best.pt" --targets "$root/contributions/ucd_targets.json" --groups "$root/contributions/profile_groups.json"
+.\.venv\Scripts\python.exe scripts/training/evaluate_test.py --config $cfg --checkpoint "$root/joint/lambda_0.1/joint_best.pt" --targets "$root/contributions/ucd_targets.json"
+```
+
+`lambda_0.1` is an example selected checkpoint path; use the path printed by `train_joint.py` after validation selection. Do not select hyperparameters from test results. Each stage records protocol/provenance in its output, logs, checkpoints, and final metrics. Contribution targets and profile assignments are tied to the exact reference checkpoint hash and training-ID hash.
+
+## AVE annotation integrity
+
+Run `python scripts/data/prepare_ave_manifest.py --include-source-video-disjoint --seed 17` to regenerate the manifests and reproducible JSON integrity reports. The audit reports exact annotation duplicates, repeated source/label/interval combinations, source-level label conflicts, overlapping or identical event intervals, missing/invalid intervals, source-ID split overlap, and manifest/summary consistency, including sample IDs and annotation fields. Original rows are retained in both manifests; exact duplicates are reported and remain eligible for training. Distinct non-overlapping segments from a source video are not deduplicated. The disjoint split assigns all segments from one source to exactly one partition. Conflicts are reported rather than silently relabelled.
+
+The AVE configs set `contribution.fcd_kwargs.exclude_same_source_negatives: true`. Other current-batch and queued segments from the same source video are excluded as negatives while the positive paired example is retained. Datasets without source IDs fall back to sample-ID exclusion; too few valid candidates produce an explicit error. This policy is part of the experiment design and is not claimed to reproduce Utopia exactly. The FCD probability transform also uses Softplus because finite-sample InfoNCE bounds may be negative; it is an adaptation, not an exact reproduction.
+
+## Device selection
+
+Run commands accept `--device auto|cuda|cpu`; the config may also set `device`. `auto` selects CUDA when PyTorch reports it available, otherwise CPU. Startup logs show the selected device, GPU name, CUDA availability, and PyTorch CUDA version; CPU runs explicitly report CPU. An explicit `--device cuda` fails if CUDA is unavailable. Model and batch placement is checked, and the device is recorded in metadata and checkpoints. Check the local installation with `python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"`. Device selection does not measure GPU speed.
 
 ## Verification status
 
-Checks executed in this workspace during the audit:
+The reliability suite exercises tiny reference-to-joint training paths for both protocols, compatible and deliberately mismatched artifacts, manifest audit cases, FCD source/sample exclusions, and CPU/CUDA selection behavior. Run these checks from the repository root:
 
-- `python scripts/data/prepare_ave_manifest.py --include-source-video-disjoint --seed 17` completed and generated the alternative manifest and summary.
-- The generated disjoint split contains 2,647 train, 665 validation, and 828 test segments; all 28 classes occur in each partition and all source-ID intersections are empty.
-- `.venv\Scripts\python.exe -m pytest tests -q -p no:cacheprovider --tb=short` passed 11 tests, including a synthetic reference/signature/FCD/group/UCD/joint/checkpoint/test-evaluator path. No AVE media or pretrained weights were needed.
-- `.venv\Scripts\python.exe -m compileall -q src scripts tests` passed.
-- `--help` succeeded for reference training, contribution estimation, joint training, test evaluation, feature caching, and AVE manifest preparation.
-- The FCD equations were inspected in the local Utopia paper, especially Eqs. (7)–(11), pages 4–5.
+```powershell
+python -m pytest -q -p no:cacheprovider tests
+python -m compileall -q src scripts tests
+python scripts/training/train_reference.py --help
+python scripts/training/estimate_contributions.py --help
+python scripts/training/train_joint.py --help
+python scripts/training/evaluate_test.py --help
+python scripts/training/cache_features.py --help
+python scripts/data/prepare_ave_manifest.py --help
+```
 
-No real AVE training, pretrained-weight download, or performance experiment has been run. Although all classes appear in all three generated disjoint partitions for this seed, other datasets/seeds may have missing classes; consult the generated summary. Current unit tests do not validate full PANNs/ResNet inference or real-media decoder behavior.
+Results for this reliability pass: the pytest command passed all 23 tests; `compileall` succeeded; all six CLI help commands exited successfully. The manifest command `python scripts/data/prepare_ave_manifest.py --include-source-video-disjoint --seed 17` regenerated both reports with consistent summaries, no exact duplicate rows, 45 cross-label source conflicts, 47 overlapping/identical interval pairs, and one invalid interval. A direct AVEDataset read/decode of the first training sample succeeded under both protocols using the extracted local audio/video. A small fusion forward/backward smoke also ran on the detected NVIDIA GeForce RTX 3050 6GB Laptop GPU (PyTorch CUDA 12.8); this verifies basic CUDA placement and execution, not full AVE training or speed.
+
+No full pretrained-model training or performance experiment has been run. The official protocol retains published source-video overlap; use the disjoint protocol when source-level independence is required. The invalid interval and annotation label conflicts remain reported in the integrity JSON and are not automatically repaired or removed.

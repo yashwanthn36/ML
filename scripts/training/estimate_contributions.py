@@ -15,6 +15,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from multimodal.contribution import build_ucd_targets, estimate_reference_fcd, estimate_signatures
 from multimodal.grouping import cluster_profiles
+from multimodal.training.device import select_device
+from multimodal.training.provenance import (checkpoint_provenance, effective_split_protocol,
+    file_sha256, validate_checkpoint, validate_provenance, configured_split_protocol,
+    ensure_protocol_output)
 
 
 def load_factory(spec: str):
@@ -28,28 +32,44 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--estimation-ids", type=Path)
+    parser.add_argument("--allow-legacy-artifacts", action="store_true",
+                        help="Explicitly accept older artifacts without complete run provenance")
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"))
     args = parser.parse_args()
     config_path = args.config if args.config.is_absolute() else PROJECT_ROOT / args.config
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    configured_protocol = configured_split_protocol(config)
+    if args.device:
+        config["device"] = args.device
+    device = select_device(str(config.get("device", "auto")))
     dataset_cfg, model_cfg, training_cfg = config["dataset"], config["model"], config["training"]
     dataset_kwargs = dict(dataset_cfg.get("kwargs", {}))
     if "split_protocol" in dataset_cfg:
         dataset_kwargs["split_protocol"] = dataset_cfg["split_protocol"]
     train_set, _ = load_factory(dataset_cfg["factory"])(**dataset_kwargs)
-    model = load_factory(model_cfg["factory"])(num_classes=train_set.num_classes,
-                                                **model_cfg.get("kwargs", {}))
+    split_protocol = effective_split_protocol(train_set, configured_protocol)
     checkpoint_path = args.checkpoint if args.checkpoint.is_absolute() else PROJECT_ROOT / args.checkpoint
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    ref_provenance = validate_checkpoint(checkpoint, split_protocol=split_protocol,
+        seed=int(config["seed"]), config=config, training_sample_ids=list(train_set.sample_ids),
+        allow_legacy=args.allow_legacy_artifacts)
+    model = load_factory(model_cfg["factory"])(num_classes=train_set.num_classes,
+                                                **model_cfg.get("kwargs", {}))
     model.load_state_dict(checkpoint["model_state_dict"])
     out = args.output_dir or (PROJECT_ROOT / config["output_dir"] / f"seed_{config['seed']}" / "contributions")
     if not out.is_absolute():
         out = PROJECT_ROOT / out
-    out.mkdir(parents=True, exist_ok=True)
+    out = ensure_protocol_output(out, split_protocol=split_protocol, seed=int(config["seed"]))
     estimation_ids_path = args.estimation_ids or (checkpoint_path.parent / "training_estimation_ids.json")
     if not estimation_ids_path.is_absolute():
         estimation_ids_path = PROJECT_ROOT / estimation_ids_path
     if estimation_ids_path.exists():
         estimation_metadata = json.loads(estimation_ids_path.read_text(encoding="utf-8"))
+        if ref_provenance is not None:
+            validate_provenance(ref_provenance, estimation_metadata.get("provenance"),
+                                artifact="training_estimation_ids.json", allow_legacy=args.allow_legacy_artifacts)
+        elif not args.allow_legacy_artifacts:
+            raise ValueError("Reference checkpoint has no run provenance; pass --allow-legacy-artifacts explicitly")
         estimation_ids = set(estimation_metadata["sample_ids"])
         training_ids = set(train_set.sample_ids)
         unknown_ids = sorted(estimation_ids - training_ids)
@@ -64,10 +84,12 @@ def main() -> None:
     else:
         raise FileNotFoundError("Reference checkpoint has no training_estimation_ids.json; refusing to "
                                 "silently estimate contributions on all reference-training examples")
+    if set(estimation_ids) != {train_set.sample_ids[i] for i in estimation_indices}:
+        raise ValueError("Estimation ID metadata does not exactly match the current training dataset")
     loader_args = {"batch_size": int(training_cfg["batch_size"]), "shuffle": False,
-                   "num_workers": int(training_cfg["num_workers"]), "pin_memory": torch.cuda.is_available()}
+                   "num_workers": int(training_cfg["num_workers"]), "pin_memory": device.type == "cuda"}
     estimation_loader = DataLoader(estimation_set, **loader_args)
-    signatures_path = estimate_signatures(model, estimation_loader, out / "estimation_signatures.csv")
+    signatures_path = estimate_signatures(model, estimation_loader, out / "estimation_signatures.csv", device=device)
     fcd_spec = config.get("contribution", {}).get("fcd_factory")
     if not fcd_spec:
         raise ValueError("Set contribution.fcd_factory to the configured mutual-information estimator")
@@ -75,12 +97,12 @@ def main() -> None:
     fcd_estimator = getattr(importlib.import_module(fcd_module), fcd_name)(
         **config.get("contribution", {}).get("fcd_kwargs", {})
     )
-    reference_fcd = estimate_reference_fcd(model, estimation_loader, fcd_estimator)
+    reference_fcd = estimate_reference_fcd(model, estimation_loader, fcd_estimator, device=device)
     (out / "reference_fcd.json").write_text(json.dumps(reference_fcd, indent=2), encoding="utf-8")
     all_signatures_path = None
     if len(estimation_set) != len(train_set):
         all_loader = DataLoader(train_set, **loader_args)
-        all_signatures_path = estimate_signatures(model, all_loader, out / "all_training_signatures.csv")
+        all_signatures_path = estimate_signatures(model, all_loader, out / "all_training_signatures.csv", device=device)
     contribution_cfg = config.get("contribution", {})
     grouping = cluster_profiles(
         signatures_path, out / "profile_groups.json",
@@ -98,9 +120,26 @@ def main() -> None:
         seed=int(config["seed"]),
         max_bootstrap_std=contribution_cfg.get("max_bootstrap_std", 0.15),
     )
+    training_ids_hash = (ref_provenance or {}).get("training_sample_ids_sha256")
+    if training_ids_hash is None:
+        from multimodal.training.provenance import ids_hash
+        training_ids_hash = ids_hash(list(train_set.sample_ids))
+    artifact_provenance = {
+        **(ref_provenance or {"split_protocol": split_protocol, "seed": int(config["seed"]),
+                              "run_id": f"legacy-{file_sha256(checkpoint_path)[:16]}",
+                              "training_sample_ids_sha256": training_ids_hash,
+                              "estimation_sample_ids_sha256": "legacy-unverified",
+                              "experiment_config_sha256": "legacy-unverified"}),
+        "reference_checkpoint_sha256": file_sha256(checkpoint_path),
+    }
+    grouping["provenance"] = artifact_provenance
+    targets["provenance"] = artifact_provenance
+    (out / "profile_groups.json").write_text(json.dumps(grouping, indent=2), encoding="utf-8")
+    (out / "ucd_targets.json").write_text(json.dumps(targets, indent=2), encoding="utf-8")
     protocol = {
         "protocol": estimation_metadata.get("protocol", "unspecified"),
-        "split_protocol": getattr(train_set, "split_protocol", dataset_cfg.get("split_protocol", "unknown")),
+        "provenance": artifact_provenance,
+        "split_protocol": split_protocol,
         "estimation_sample_ids": sorted(estimation_ids),
         "reference_fit_sample_ids": estimation_metadata.get("fit_sample_ids", []),
         "reference_fit_source_ids": estimation_metadata.get("fit_source_ids", []),
@@ -109,6 +148,7 @@ def main() -> None:
         "assignment_source_ids": list(getattr(train_set, "source_ids", [])),
         "assignment_signatures_include_reference_fit_examples": all_signatures_path is not None,
         "validation_or_test_used": False,
+        "device": str(device),
         "limitations": estimation_metadata.get("limitations", []),
     }
     (out / "contribution_protocol.json").write_text(json.dumps(protocol, indent=2), encoding="utf-8")
